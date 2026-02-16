@@ -9,7 +9,7 @@ AppDir:
     version: 1.0.0
   apt:
     arch: amd64
-    release: jammy
+    distribution: jammy
     include:
       - libgtk-3-0
       - libglib2.0-0
