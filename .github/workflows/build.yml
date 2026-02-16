@@ -1,28 +1,32 @@
-name: Flutter AppImage Build
+name: Flutter Universal AppImage Build
 on: [push, workflow_dispatch]
 
 jobs:
   build:
-    runs-on: ubuntu-22.04 # Используем более старую базу для лучшей совместимости
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Build Dependencies
+      - name: Install All Dependencies (WebRTC + Audio + GTK)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libjsoncpp-dev libnotify-dev libasound2-dev libpulse-dev
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libsecret-1-dev libjsoncpp-dev \
+            libnotify-dev libasound2-dev libpulse-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libdrm-dev libgbm-dev # Дополнительно для рендеринга видео в WebRTC
 
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
           
-      - name: Build Linux Release
+      - name: Flutter Get and Build
         run: |
           flutter pub get
           flutter build linux --release
 
-      # Упаковка в AppImage
-      - name: Package AppImage
+      - name: Package Universal AppImage
         uses: AppImageCrafters/build-appimage-action@v1
         with:
           recipe: |
@@ -30,7 +34,7 @@ jobs:
             AppDir:
               path: build/linux/x64/release/bundle
               app_info:
-                id: com.example.new_messenger
+                id: com.alex.new_messenger
                 name: new_messenger
                 icon: utilities-terminal
                 exec: new_messenger
@@ -38,12 +42,20 @@ jobs:
                 arch: amd64
                 dist: jammy
                 components: [main, universe]
-                packages: [libgtk-3-0, libglib2.0-0, libsecret-1-0, libnotify4, libasound2, libpulse0]
+                packages: 
+                  - libgtk-3-0
+                  - libglib2.0-0
+                  - libsecret-1-0
+                  - libnotify4
+                  - libasound2
+                  - libpulse0
+                  - libgstreamer1.0-0
+                  - libgstreamer-plugins-base1.0-0
             AppImage:
               arch: x64
               update-information: none
 
-      - name: Upload AppImage
+      - name: Upload Finished AppImage
         uses: actions/upload-artifact@v4
         with:
           name: messenger-universal-app
