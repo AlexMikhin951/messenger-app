@@ -6,6 +6,7 @@ AppDir:
     name: new_messenger
     icon: utilities-terminal
     exec: new_messenger
+    version: 1.0.0 # Обязательная строка, которой не хватало
   apt:
     arch: amd64
     dist: jammy
