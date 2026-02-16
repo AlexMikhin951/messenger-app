@@ -1,12 +1,13 @@
 version: 1
 AppDir:
   path: build/linux/x64/release/bundle
+  version: 1.0.0
   app_info:
     id: com.alex.new_messenger
     name: new_messenger
     icon: utilities-terminal
     exec: new_messenger
-    version: 1.0.0 # Обязательная строка, которой не хватало
+    version: 1.0.0
   apt:
     arch: amd64
     dist: jammy
