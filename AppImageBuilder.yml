@@ -9,7 +9,6 @@ AppDir:
     version: 1.0.0
   apt:
     arch: amd64
-    distribution: jammy
     include:
       - libgtk-3-0
       - libglib2.0-0
@@ -21,7 +20,6 @@ AppDir:
       - libgstreamer-plugins-base1.0-0
     sources:
       - sourceline: 'deb http://archive.ubuntu.com/ubuntu/ jammy main universe'
-      - sourceline: 'deb http://archive.ubuntu.com/ubuntu/ jammy-updates main universe'
 
 AppImage:
   arch: x64
