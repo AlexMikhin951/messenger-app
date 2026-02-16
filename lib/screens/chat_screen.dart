@@ -1,3 +1,5 @@
+import 'dart:io'; // Для Platform
+import 'package:flutter/foundation.dart'; // Для kIsWeb
 import 'package:flutter/material.dart';
 import 'package:pocketbase/pocketbase.dart';
 import 'package:file_picker/file_picker.dart';
@@ -21,23 +23,25 @@ class _ChatScreenState extends State<ChatScreen> {
   late String _myId;
   bool _isInitialLoading = true;
 
-  // Карта для хранения статуса загрузки файлов по ID сообщения
   final Map<String, bool> _downloadingFiles = {};
 
   @override
   void initState() {
     super.initState();
-    _myId = api.pb.authStore.record!.id;
-    _initChat();
+    _myId = api.pb.authStore.record?.id ?? "";
+    if (_myId.isNotEmpty) {
+      _initChat();
+    } else {
+      debugPrint("Ошибка: Пользователь не авторизован");
+      setState(() => _isInitialLoading = false);
+    }
   }
 
   Future<void> _initChat() async {
     await _loadMessages();
-    await _markAsRead(); // Помечаем как прочитанные при входе
+    await _markAsRead();
     _subscribeToMessages();
   }
-
-  // --- ЛОГИКА ПРОЧТЕНИЯ ---
 
   Future<void> _markAsRead() async {
     try {
@@ -45,8 +49,10 @@ class _ChatScreenState extends State<ChatScreen> {
         final type = m.getStringValue('type');
         return m.getStringValue('receiver') == _myId &&
             m.getBoolValue('is_read') == false &&
-            // Читаем тексты, файлы и ПРОПУЩЕННЫЕ звонки
-            (type == 'text' || type == 'file' || type == 'call_missed');
+            (type == 'text' ||
+                type == 'file' ||
+                type == 'call_missed' ||
+                type == 'call_success');
       }).toList();
 
       if (unread.isEmpty) return;
@@ -60,8 +66,6 @@ class _ChatScreenState extends State<ChatScreen> {
       debugPrint("Ошибка markAsRead: $e");
     }
   }
-
-  // --- ЛОГИКА СООБЩЕНИЙ И ФАЙЛОВ ---
 
   Future<void> _loadMessages() async {
     try {
@@ -79,6 +83,7 @@ class _ChatScreenState extends State<ChatScreen> {
         });
       }
     } catch (e) {
+      debugPrint("Ошибка загрузки сообщений: $e");
       if (mounted) setState(() => _isInitialLoading = false);
     }
   }
@@ -89,21 +94,14 @@ class _ChatScreenState extends State<ChatScreen> {
         final m = e.record!;
         final senderId = m.getStringValue('sender');
         final receiverId = m.getStringValue('receiver');
-        final type = m.getStringValue('type'); // Получаем тип сообщения
+        final type = m.getStringValue('type');
 
-        // Проверяем, относится ли сообщение к этому конкретному чату
         if ((senderId == _myId && receiverId == widget.receiver.id) ||
             (senderId == widget.receiver.id && receiverId == _myId)) {
           if (mounted) {
             setState(() {
               if (e.action == 'create') {
                 _messages.insert(0, m);
-
-                // ЛОГИКА АВТО-ПРОЧТЕНИЯ:
-                // Если я получатель и это обычный контент (текст/файл),
-                // помечаем прочитанным сразу, так как экран чата открыт.
-                // Если это звонок (call_success), НЕ вызываем _markAsRead,
-                // чтобы is_read оставался false и система поняла, что это новый вызов.
                 if (receiverId == _myId && (type == 'text' || type == 'file')) {
                   _markAsRead();
                 }
@@ -112,11 +110,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 if (index != -1) {
                   _messages[index] = m;
                 }
-
-                // Если сообщение обновилось (например, стало "call_missed")
-                // и мы находимся в этом чате, можно вызвать прочтение,
-                // чтобы сразу убрать индикатор нового сообщения.
-                if (receiverId == _myId && type == 'call_missed') {
+                if (receiverId == _myId &&
+                    (type == 'call_missed' || type == 'call_success')) {
                   _markAsRead();
                 }
               }
@@ -145,22 +140,39 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _pickAndSendFile() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles();
-    if (result != null && result.files.single.path != null) {
-      final file = result.files.single;
+    FilePickerResult? result =
+        await FilePicker.platform.pickFiles(withData: true);
+    if (result != null) {
+      final fileObj = result.files.single;
+      setState(() => _isInitialLoading = true);
       try {
+        http.MultipartFile multipartFile;
+        if (kIsWeb) {
+          if (fileObj.bytes == null)
+            throw Exception("Не удалось прочитать файл");
+          multipartFile = http.MultipartFile.fromBytes(
+              'attachment', fileObj.bytes!,
+              filename: fileObj.name);
+        } else {
+          if (fileObj.path == null) return;
+          multipartFile = await http.MultipartFile.fromPath(
+              'attachment', fileObj.path!,
+              filename: fileObj.name);
+        }
         await api.pb.collection('messages').create(
           body: {
             "sender": _myId,
             "receiver": widget.receiver.id,
-            "content": file.name,
+            "content": fileObj.name,
             "type": "file",
             "is_read": false,
           },
-          files: [await http.MultipartFile.fromPath('attachment', file.path!)],
+          files: [multipartFile],
         );
       } catch (e) {
         debugPrint("Ошибка отправки файла: $e");
+      } finally {
+        if (mounted) setState(() => _isInitialLoading = false);
       }
     }
   }
@@ -178,51 +190,66 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       debugPrint("Ошибка при работе с файлом: $e");
     } finally {
-      if (mounted) {
-        setState(() => _downloadingFiles.remove(m.id));
-      }
+      if (mounted) setState(() => _downloadingFiles.remove(m.id));
     }
   }
 
   void _startVideoCall() async {
+    if (_myId.isEmpty) return;
+    String? createdMessageId;
     try {
       final callMsg = await api.pb.collection('messages').create(body: {
         "sender": _myId,
         "receiver": widget.receiver.id,
-        "content": "Входящий видеозвонок...",
+        "content": "📞 Исходящий видеозвонок...",
         "type": "call_success",
-        "is_read":
-            true, // СТАВИМ TRUE: вызов считается "просмотренным" по умолчанию
+        "is_read": true,
       });
-
-      if (!mounted) return;
-
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) => VideoCallScreen(
-            receiverId: widget.receiver.id,
-            isIncoming: false,
-            messageId: callMsg.id,
-          ),
-        ),
-      );
+      createdMessageId = callMsg.id;
     } catch (e) {
-      debugPrint("Не удалось начать звонок: $e");
+      debugPrint("Ошибка создания звонка: $e");
     }
+
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => VideoCallScreen(
+          receiverId: widget.receiver.id,
+          isIncoming: false,
+          messageId: createdMessageId,
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: const Color(0xFFF5F7FB),
       appBar: AppBar(
-        title: Text(widget.receiver.getStringValue('name')),
+        elevation: 2,
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black87,
+        title: Row(
+          children: [
+            CircleAvatar(
+              backgroundColor: Colors.blue.shade100,
+              child:
+                  Text(widget.receiver.getStringValue('name')[0].toUpperCase()),
+            ),
+            const SizedBox(width: 12),
+            Text(widget.receiver.getStringValue('name'),
+                style: const TextStyle(fontSize: 18)),
+          ],
+        ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.videocam_rounded, size: 28),
+            icon: const Icon(Icons.videocam_rounded,
+                color: Colors.blue, size: 28),
             onPressed: _startVideoCall,
           ),
+          const SizedBox(width: 8),
         ],
       ),
       body: Column(
@@ -232,7 +259,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 ? const Center(child: CircularProgressIndicator())
                 : ListView.builder(
                     reverse: true,
-                    padding: const EdgeInsets.all(16),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 16),
                     itemCount: _messages.length,
                     itemBuilder: (context, index) =>
                         _renderMessage(_messages[index]),
@@ -246,51 +274,62 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _renderMessage(RecordModel m) {
     final String type = m.getStringValue('type', 'text');
-    final bool isMe = m.getStringValue('sender') == _myId;
-    final String content = m.getStringValue('content');
-
     if (type == 'call_missed' || type == 'call_success') {
-      return _buildSystemMessage(type, content);
+      return _buildSystemMessage(m);
     }
-    return _buildMessageBubble(m, isMe, type, content);
+    return _buildMessageBubble(m);
   }
 
-  Widget _buildSystemMessage(String type, String content) {
-    bool isMissed = type == 'call_missed';
+  Widget _buildSystemMessage(RecordModel m) {
+    final String type = m.getStringValue('type');
+    final String content = m.getStringValue('content');
+    final bool isMissed = type == 'call_missed';
+
     return Center(
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 12),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         decoration: BoxDecoration(
-            color: isMissed
-                ? Colors.red.withOpacity(0.05)
-                : Colors.green.withOpacity(0.05),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-                color: isMissed
-                    ? Colors.red.withOpacity(0.2)
-                    : Colors.green.withOpacity(0.2))),
+          // Цвет звонка: красный для пропущенного, зеленый для успешного
+          color: isMissed
+              ? Colors.red.withOpacity(0.1)
+              : Colors.green.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+              color: isMissed
+                  ? Colors.red.withOpacity(0.2)
+                  : Colors.green.withOpacity(0.2)),
+        ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(isMissed ? Icons.call_missed : Icons.call_made,
-                size: 16, color: isMissed ? Colors.red : Colors.green),
+            Icon(
+              isMissed ? Icons.call_missed : Icons.call_made,
+              size: 16,
+              color: isMissed ? Colors.red : Colors.green,
+            ),
             const SizedBox(width: 8),
-            Text(content,
-                style: TextStyle(
-                    fontSize: 13,
-                    color:
-                        isMissed ? Colors.red.shade700 : Colors.green.shade700,
-                    fontWeight: FontWeight.w500)),
+            Text(
+              content,
+              style: TextStyle(
+                fontSize: 13,
+                color: isMissed ? Colors.red.shade700 : Colors.green.shade700,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildMessageBubble(
-      RecordModel m, bool isMe, String type, String content) {
+  Widget _buildMessageBubble(RecordModel m) {
+    final bool isMe = m.getStringValue('sender') == _myId;
+    final String type = m.getStringValue('type');
+    final String content = m.getStringValue('content');
+    final bool isRead = m.getBoolValue('is_read');
     final bool isDownloading = _downloadingFiles[m.id] ?? false;
+
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
@@ -301,11 +340,26 @@ class _ChatScreenState extends State<ChatScreen> {
           constraints: BoxConstraints(
               maxWidth: MediaQuery.of(context).size.width * 0.75),
           decoration: BoxDecoration(
-            color: isMe ? Colors.blue.shade600 : Colors.grey.shade200,
-            borderRadius: BorderRadius.circular(16),
+            color: isMe ? Colors.blue.shade600 : Colors.white,
+            borderRadius: BorderRadius.only(
+              topLeft: const Radius.circular(16),
+              topRight: const Radius.circular(16),
+              bottomLeft: Radius.circular(isMe ? 16 : 0),
+              bottomRight: Radius.circular(isMe ? 0 : 16),
+            ),
+            boxShadow: [
+              BoxShadow(
+                  color: Colors.black.withOpacity(0.05),
+                  blurRadius: 4,
+                  offset: const Offset(0, 2)),
+            ],
           ),
-          child: type == 'file'
-              ? Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (type == 'file')
+                Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (isDownloading)
@@ -319,16 +373,31 @@ class _ChatScreenState extends State<ChatScreen> {
                           color: isMe ? Colors.white : Colors.blue),
                     const SizedBox(width: 8),
                     Flexible(
-                        child: Text(content,
-                            style: TextStyle(
-                                color: isMe ? Colors.white : Colors.black87,
-                                decoration: TextDecoration.underline))),
+                      child: Text(content,
+                          style: TextStyle(
+                              color: isMe ? Colors.white : Colors.black87,
+                              decoration: TextDecoration.underline)),
+                    ),
                   ],
                 )
-              : Text(content,
-                  style: TextStyle(
-                      color: isMe ? Colors.white : Colors.black87,
-                      fontSize: 16)),
+              else
+                Text(content,
+                    style: TextStyle(
+                        color: isMe ? Colors.white : Colors.black87,
+                        fontSize: 16)),
+
+              // Индикатор прочтения (только для моих сообщений)
+              if (isMe)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Icon(
+                    isRead ? Icons.done_all : Icons.done,
+                    size: 16,
+                    color: isRead ? Colors.lightBlueAccent : Colors.white70,
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );
@@ -336,36 +405,46 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildInputArea() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-          color: Colors.white,
-          border: Border(top: BorderSide(color: Colors.grey.shade200))),
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+              color: Colors.black.withOpacity(0.05),
+              blurRadius: 10,
+              offset: const Offset(0, -2))
+        ],
+      ),
       child: SafeArea(
         child: Row(
           children: [
             IconButton(
-                icon: const Icon(Icons.add_circle_outline,
-                    color: Colors.blue, size: 28),
-                onPressed: _pickAndSendFile),
+              icon: const Icon(Icons.add_circle_outline,
+                  color: Colors.blue, size: 28),
+              onPressed: _pickAndSendFile,
+            ),
             Expanded(
-              child: TextField(
-                controller: _msgController,
-                decoration: InputDecoration(
-                  hintText: "Сообщение...",
-                  border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(25),
-                      borderSide: BorderSide.none),
-                  filled: true,
-                  fillColor: Colors.grey.shade100,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                decoration: BoxDecoration(
+                    color: Colors.grey.shade100,
+                    borderRadius: BorderRadius.circular(24)),
+                child: TextField(
+                  controller: _msgController,
+                  decoration: const InputDecoration(
+                      hintText: "Сообщение...", border: InputBorder.none),
+                  onSubmitted: (_) => _sendMessage(),
                 ),
-                onSubmitted: (_) => _sendMessage(),
               ),
             ),
             const SizedBox(width: 8),
-            IconButton(
-                icon: const Icon(Icons.send, color: Colors.blue),
-                onPressed: _sendMessage),
+            CircleAvatar(
+              backgroundColor: Colors.blue,
+              child: IconButton(
+                icon: const Icon(Icons.send, color: Colors.white, size: 20),
+                onPressed: _sendMessage,
+              ),
+            ),
           ],
         ),
       ),
@@ -374,7 +453,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    api.pb.collection('messages').unsubscribe('*');
+    try {
+      api.pb.collection('messages').unsubscribe('*');
+    } catch (_) {}
     _msgController.dispose();
     super.dispose();
   }

@@ -1,5 +1,8 @@
+import 'dart:io';
+import 'package:flutter/foundation.dart'; // Для kIsWeb
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
+import '../services/signaling_manager.dart'; // ! Добавляем импорт
 import 'contacts_screen.dart';
 
 class AuthScreen extends StatefulWidget {
@@ -26,19 +29,22 @@ class _AuthScreenState extends State<AuthScreen> {
       return;
     }
 
-    // Тот самый пароль, который мы генерируем по номеру
+    // Пароль, генерируемый по номеру
     final String hiddenPassword = "family_member_$phone";
 
     try {
       // 1. Попытка входа
       await api.pb.collection('users').authWithPassword(phone, hiddenPassword);
 
-      // Сохраняем данные для авто-входа (через твой сервис)
+      // ! ВАЖНО: Запускаем сервисы звонков после входа
+      _initSignaling();
+
+      // Сохраняем данные
       await api.saveCredentials(phone, hiddenPassword);
 
       _goToContacts();
     } catch (e) {
-      // 2. Если пользователя нет, показываем поле для ввода имени (регистрация)
+      // 2. Если пользователя нет -> Регистрация
       if (!_showNameField) {
         setState(() {
           _showNameField = true;
@@ -54,7 +60,7 @@ class _AuthScreenState extends State<AuthScreen> {
       }
 
       try {
-        // 3. Регистрация нового пользователя
+        // 3. Регистрация
         await api.pb.collection('users').create(body: {
           "username": phone,
           "name": _nameController.text.trim(),
@@ -62,10 +68,13 @@ class _AuthScreenState extends State<AuthScreen> {
           "passwordConfirm": hiddenPassword,
         });
 
-        // Входим сразу после регистрации
+        // Вход сразу после регистрации
         await api.pb
             .collection('users')
             .authWithPassword(phone, hiddenPassword);
+
+        // ! ВАЖНО: Запускаем сервисы звонков после регистрации
+        _initSignaling();
 
         // Сохраняем учетные данные
         await api.saveCredentials(phone, hiddenPassword);
@@ -76,6 +85,19 @@ class _AuthScreenState extends State<AuthScreen> {
       }
     } finally {
       if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  // Вынес инициализацию в отдельный метод
+  void _initSignaling() {
+    try {
+      SignalingManager().startHeartbeat();
+      // Слушаем уведомления только на десктопе
+      if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
+        SignalingManager().startListeningNotifications();
+      }
+    } catch (e) {
+      debugPrint("Ошибка инициализации сигналинга: $e");
     }
   }
 
@@ -96,6 +118,7 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Весь остальной UI код без изменений, он хороший
     return Scaffold(
       body: Container(
         decoration: BoxDecoration(

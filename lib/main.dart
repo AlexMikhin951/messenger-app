@@ -1,9 +1,9 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart'; // Нужно для kIsWeb
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart'
-    show kIsWeb; // Добавлено для безопасной проверки Web
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:local_notifier/local_notifier.dart';
+import 'package:window_manager/window_manager.dart'; // Рекомендую добавить для управления окном на Desktop
 
 import 'services/api_service.dart';
 import 'services/signaling_manager.dart';
@@ -16,8 +16,13 @@ import 'screens/video_call_screen.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // ПРАВКА: Проверка kIsWeb предотвращает вызов Platform.isWindows в браузере
-  if (!kIsWeb && Platform.isWindows) {
+  // 1. Настройка для Десктопа (Windows и Linux)
+  // Важно: проверяем !kIsWeb, так как Platform.is... может вызвать ошибку в браузере
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
+    // Инициализация window_manager (если используете) для красивого окна
+    // await windowManager.ensureInitialized();
+
+    // Настройка уведомлений только для десктопа
     await localNotifier.setup(
       appName: 'Family Messenger',
       shortcutPolicy: ShortcutPolicy.requireCreate,
@@ -33,41 +38,59 @@ void main() async {
 
   Widget initialScreen = const AuthScreen();
 
+  // Флаг успешной авторизации
+  bool isAuthenticated = false;
+
   if (savedPhone != null && savedPass != null) {
     try {
       await api.pb.collection('users').authWithPassword(savedPhone, savedPass);
+      isAuthenticated = true;
+
+      // Запускаем heartbeat только если авторизовались
       SignalingManager().startHeartbeat();
 
-      // ПРАВКА: Добавлена проверка на Web
-      if (!kIsWeb && Platform.isWindows) {
+      // Слушаем уведомления о входящих только на Десктопе (на Web нужны Push-уведомления/ServiceWorker)
+      if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
         SignalingManager().startListeningNotifications();
       }
+
       initialScreen = const ContactsScreen();
     } catch (e) {
       debugPrint("Автологин не удался: $e");
+      // Если автологин не удался, остаемся на AuthScreen
     }
   }
 
-  runApp(FamilyMessengerApp(initialScreen: initialScreen));
+  runApp(FamilyMessengerApp(
+      initialScreen: initialScreen, isAuthenticated: isAuthenticated));
 }
 
 class FamilyMessengerApp extends StatelessWidget {
   final Widget initialScreen;
-  const FamilyMessengerApp({super.key, required this.initialScreen});
+  final bool isAuthenticated;
 
-  // Ключ навигации для глобального контроля окон
+  const FamilyMessengerApp({
+    super.key,
+    required this.initialScreen,
+    this.isAuthenticated = false,
+  });
+
   static final GlobalKey<NavigatorState> navigatorKey =
       GlobalKey<NavigatorState>();
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      navigatorKey: navigatorKey, // Регистрируем ключ
+      navigatorKey: navigatorKey,
       debugShowCheckedModeBanner: false,
       title: 'Family Messenger',
+      // Настраиваем тему, чтобы было похоже на десктопное приложение
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        colorScheme: ColorScheme.fromSeed(
+            seedColor: Colors.blue, brightness: Brightness.light),
         useMaterial3: true,
+        // Для десктопа визуальная плотность должна быть обычной или компактной
+        visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
       routes: {
         '/auth': (context) => const AuthScreen(),
@@ -76,12 +99,9 @@ class FamilyMessengerApp extends StatelessWidget {
       onGenerateRoute: (settings) {
         if (settings.name == '/call') {
           final args = settings.arguments as Map<String, dynamic>?;
-
-          // Проверка: переданы ли обязательные параметры
           if (args != null && args.containsKey('receiverId')) {
             return MaterialPageRoute(
-              settings:
-                  settings, // Передаем настройки, чтобы работал ModalRoute
+              settings: settings,
               builder: (context) => VideoCallScreen(
                 receiverId: args['receiverId'],
                 isIncoming: args['isIncoming'] ?? false,
@@ -94,15 +114,17 @@ class FamilyMessengerApp extends StatelessWidget {
       },
       home: Builder(
         builder: (context) {
+          // Инициализируем Deep Links
           LinkService().init(context);
 
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (initialScreen is ContactsScreen) {
-              // Инициализируем слушателей
+          // Инициализируем слушателей звонков ПОСЛЕ отрисовки первого кадра
+          if (isAuthenticated) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              // Проверяем, не запущено ли уже, чтобы избежать дублирования
               SignalingManager().initCallListener(context);
               SignalingManager().checkActiveCalls(context);
-            }
-          });
+            });
+          }
 
           return Scaffold(body: SafeArea(child: initialScreen));
         },

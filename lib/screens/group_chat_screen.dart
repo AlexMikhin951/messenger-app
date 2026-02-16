@@ -1,9 +1,12 @@
+import 'dart:io'; // Для Platform
+import 'package:flutter/foundation.dart'; // Для kIsWeb
 import 'package:flutter/material.dart';
 import 'package:pocketbase/pocketbase.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/group_chat_service.dart';
 import '../services/api_service.dart';
+import 'package:http/http.dart' as http;
 
 class GroupChatScreen extends StatefulWidget {
   final String groupId;
@@ -30,31 +33,25 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   @override
   void initState() {
     super.initState();
+    // Безопасное получение ID
     _myId = _service.api.pb.authStore.record?.id ?? '';
     _initChat();
   }
 
   Future<void> _initChat() async {
     await _loadHistory();
-    // Подписываемся на новые сообщения в реальном времени
+    // Подписываемся на новые сообщения
     _service.subscribe(widget.groupId, (record) {
-      _updateOrAddMessage(record);
-    });
-  }
-
-  // Общий метод для обновления UI
-  void _updateOrAddMessage(RecordModel record) {
-    if (!mounted) return;
-    setState(() {
-      final index = _messages.indexWhere((m) => m.id == record.id);
-      if (index == -1) {
-        // Добавляем новое сообщение в начало (т.к. reverse: true)
-        _messages.insert(0, record);
-        _checkAndMarkRead(record);
-      } else {
-        // Если сообщение уже есть (например, мы его добавили вручную при отправке),
-        // обновляем его данными с сервера (например, появится поле expand)
-        _messages[index] = record;
+      if (mounted) {
+        setState(() {
+          final index = _messages.indexWhere((m) => m.id == record.id);
+          if (index == -1) {
+            _messages.insert(0, record);
+            _checkAndMarkRead(record);
+          } else {
+            _messages[index] = record;
+          }
+        });
       }
     });
   }
@@ -90,13 +87,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (_msgController.text.trim().isEmpty) return;
     final text = _msgController.text.trim();
     _msgController.clear();
-
     try {
-      // Ожидаем, что sendText вернет созданный RecordModel
-      final record = await _service.sendText(widget.groupId, text);
-      if (record != null) {
-        _updateOrAddMessage(record);
-      }
+      await _service.sendText(widget.groupId, text);
     } catch (e) {
       debugPrint("Ошибка отправки текста: $e");
       if (mounted) {
@@ -109,17 +101,27 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   Future<void> _onPickFile() async {
     try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles();
-      if (result != null && result.files.single.path != null) {
+      // ! ВАЖНО: withData: true нужно для веба
+      FilePickerResult? result =
+          await FilePicker.platform.pickFiles(withData: true);
+
+      if (result != null) {
         final file = result.files.single;
-        final record =
-            await _service.sendFile(widget.groupId, file.path!, file.name);
-        if (record != null) {
-          _updateOrAddMessage(record);
-        }
+
+        // ! Исправленная логика отправки для кроссплатформенности
+        // Передаем и путь (для Desktop), и байты (для Web)
+        await _service.sendFile(widget.groupId,
+            path: kIsWeb ? null : file.path,
+            bytes: file.bytes,
+            filename: file.name);
       }
     } catch (e) {
       debugPrint("Ошибка выбора файла: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Ошибка отправки файла: $e")),
+        );
+      }
     }
   }
 
@@ -151,6 +153,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Весь UI код остался прежним, он корректен
     return Scaffold(
       backgroundColor: const Color(0xFFF5F7FB),
       appBar: AppBar(
@@ -185,6 +188,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       ),
     );
   }
+
+  // ... (Остальные методы _renderMessage, _buildSystemMessage, _buildBubble, _buildInputArea)
+  // Скопируйте их из вашего кода, они не требуют изменений.
 
   Widget _renderMessage(RecordModel m) {
     final String type = m.getStringValue('type', 'text');

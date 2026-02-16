@@ -29,6 +29,13 @@ jobs:
           flutter pub get
           flutter build linux --release
 
+      # ШАГ ИСПРАВЛЕНИЯ КЛЮЧЕЙ (Добавлен здесь)
+      - name: Fix GPG Keys for AppImage Builder
+        run: |
+          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 871920D1991BC93C
+          # Также даем права на запись, чтобы Docker не споткнулся
+          chmod -R 777 .
+
       - name: Package Universal AppImage
         uses: AppImageCrafters/build-appimage-action@v1
         with:

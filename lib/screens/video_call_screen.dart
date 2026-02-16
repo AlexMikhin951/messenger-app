@@ -1,8 +1,9 @@
 import 'dart:async';
-import 'dart:io' show Platform;
 import 'dart:ui';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kIsWeb; // Добавлено для Web
+// Используем foundation для проверки платформы без крашей в Web
+import 'package:flutter/foundation.dart'
+    show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:pocketbase/pocketbase.dart';
@@ -28,6 +29,7 @@ class VideoCallScreen extends StatefulWidget {
 }
 
 class _VideoCallScreenState extends State<VideoCallScreen> {
+  // Используем Singleton SignalingManager, чтобы не плодить подключения
   final SignalingManager _signaling = SignalingManager();
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
@@ -50,6 +52,13 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
   List<MediaDeviceInfo> _devices = [];
 
+  // --- ИСПРАВЛЕНИЕ: Добавлен Linux и macOS для унификации интерфейса ---
+  bool get _isDesktopOrWeb =>
+      kIsWeb ||
+      defaultTargetPlatform == TargetPlatform.windows ||
+      defaultTargetPlatform == TargetPlatform.linux || // <-- Добавлено
+      defaultTargetPlatform == TargetPlatform.macOS; // <-- Добавлено
+
   @override
   void initState() {
     super.initState();
@@ -68,16 +77,17 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     await _loadCallerInfo();
 
-    // ПРАВКА: Безопасная проверка платформы для звука
-    if (!kIsWeb &&
-        (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
-      _loadDevices();
+    // Загружаем список устройств, если это Десктоп или Веб
+    if (_isDesktopOrWeb) {
+      await _loadDevices();
     } else {
+      // Логика только для Android/iOS
       Helper.setSpeakerphoneOn(_isSpeakerOn);
     }
 
     if (widget.isIncoming) {
       _playRingtone();
+      // Небольшая задержка перед подпиской, чтобы UI успел отрисоваться
       await Future.delayed(const Duration(milliseconds: 500));
       if (_activeRoomId != null) _listenToCallTermination();
     } else {
@@ -93,6 +103,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _startCall() async {
+    // Определяем ориентацию (важно для мобилок, на десктопе обычно landscape)
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
@@ -162,6 +173,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
+          // Удаленное видео (во весь экран)
           Positioned.fill(
             child: _isRemoteVideoReady
                 ? RTCVideoView(_remoteRenderer,
@@ -169,6 +181,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                         RTCVideoViewObjectFit.RTCVideoViewObjectFitContain)
                 : _buildPlaceholder(),
           ),
+
+          // Тап для скрытия/показа контролов
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
@@ -179,6 +193,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
               child: Container(color: Colors.transparent),
             ),
           ),
+
+          // Интерфейс активного звонка
           if (_hasAccepted) ...[
             if (_isCameraOn) _buildLocalPreview(),
             _buildTopBar(),
@@ -190,6 +206,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
               child: Center(child: _buildModernControlPanel()),
             ),
           ],
+
+          // Интерфейс входящего звонка (ответ/отбой)
           if (widget.isIncoming && !_hasAccepted) _buildIncomingCallUI(),
         ],
       ),
@@ -207,6 +225,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              // Микрофон
               _buildRoundBtn(
                 icon: _isMicOn ? Icons.mic : Icons.mic_off,
                 active: _isMicOn,
@@ -218,6 +237,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                 },
               ),
               const SizedBox(width: 12),
+
+              // Камера
               _buildRoundBtn(
                 icon: _isCameraOn ? Icons.videocam : Icons.videocam_off,
                 active: _isCameraOn,
@@ -229,8 +250,10 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                 },
               ),
               const SizedBox(width: 12),
-              // ПРАВКА: Проверка Web для кнопок шаринга и настроек
-              if (!kIsWeb && (Platform.isWindows || Platform.isMacOS)) ...[
+
+              // --- ДЕСКТОПНЫЕ КНОПКИ (WEB / WIN / LINUX / MAC) ---
+              if (_isDesktopOrWeb) ...[
+                // Демонстрация экрана
                 _buildRoundBtn(
                   icon: Icons.monitor,
                   active: _isScreenSharing,
@@ -240,6 +263,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                       : Colors.blueAccent,
                 ),
                 const SizedBox(width: 12),
+
+                // Настройки (Выбор устройств)
                 _buildRoundBtn(
                   icon: Icons.settings,
                   active: true,
@@ -247,6 +272,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   color: Colors.grey.shade700,
                 ),
               ] else ...[
+                // --- МОБИЛЬНЫЕ КНОПКИ ---
+                // Громкая связь
                 _buildRoundBtn(
                   icon: _isSpeakerOn ? Icons.volume_up : Icons.volume_down,
                   active: _isSpeakerOn,
@@ -256,6 +283,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   },
                 ),
                 const SizedBox(width: 12),
+                // Смена камеры
                 _buildRoundBtn(
                   icon: Icons.flip_camera_ios,
                   active: true,
@@ -268,7 +296,10 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   },
                 ),
               ],
+
               const SizedBox(width: 12),
+
+              // Завершить звонок
               _buildRoundBtn(
                 icon: Icons.call_end,
                 active: false,
@@ -312,24 +343,27 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    // ПРАВКА: Безопасные размеры для Web
-    bool isWindows = !kIsWeb && Platform.isWindows;
-    double width = isWindows ? 200.0 : (isLandscape ? 180.0 : 120.0);
-    double height = isWindows ? 120.0 : (isLandscape ? 120.0 : 180.0);
+    // --- УНИФИКАЦИЯ: Теперь Web, Windows и Linux используют одинаковые размеры ---
+    // Это обеспечивает единый вид интерфейса на всех "больших" системах
+    double width = _isDesktopOrWeb ? 240.0 : (isLandscape ? 180.0 : 120.0);
+    double height = _isDesktopOrWeb ? 135.0 : (isLandscape ? 120.0 : 180.0);
 
     return Positioned(
       top: 60,
       right: 20,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
-        child: Container(
-          width: width,
-          height: height,
-          decoration: BoxDecoration(
-              color: Colors.black, border: Border.all(color: Colors.white24)),
-          child: RTCVideoView(_localRenderer,
-              mirror: !_isScreenSharing,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
+      child: GestureDetector(
+        // Можно добавить перетаскивание окна (Draggable), если захотите в будущем
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(16),
+          child: Container(
+            width: width,
+            height: height,
+            decoration: BoxDecoration(
+                color: Colors.black, border: Border.all(color: Colors.white24)),
+            child: RTCVideoView(_localRenderer,
+                mirror: !_isScreenSharing, // Зеркалим только если это камера
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
+          ),
         ),
       ),
     );
@@ -479,7 +513,19 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _playRingtone() async {
+    if (kIsWeb) {
+      try {
+        await _audioPlayer.setReleaseMode(ReleaseMode.loop);
+        await _audioPlayer.play(AssetSource('sounds/Ring.mp3'));
+      } catch (e) {
+        debugPrint("Web autoplay prevented: $e");
+      }
+      return;
+    }
+
     try {
+      // На Linux этот код иногда требует установленного libmpv или vlc
+      // Но audioplayers обычно имеет фоллбек
       await _audioPlayer.setAudioContext(AudioContext(
         android: AudioContextAndroid(
           contentType: AndroidContentType.sonification,
@@ -501,30 +547,48 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _loadDevices() async {
-    _devices = await navigator.mediaDevices.enumerateDevices();
-    if (mounted) setState(() {});
+    try {
+      // Получаем все устройства (камеры, микрофоны, динамики)
+      _devices = await navigator.mediaDevices.enumerateDevices();
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint("Error loading devices: $e");
+    }
   }
 
   void _showDevicePicker() {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF1A1A1A),
-      builder: (context) => Padding(
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => Container(
         padding: const EdgeInsets.all(20),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _buildDeviceCategory(
-                "Камера",
-                Icons.videocam,
-                _devices.where((d) => d.kind == 'videoinput').toList(),
-                (id) => _switchDevice('video', id)),
-            _buildDeviceCategory(
-                "Микрофон",
-                Icons.mic,
-                _devices.where((d) => d.kind == 'audioinput').toList(),
-                (id) => _switchDevice('audio', id)),
-          ],
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildDeviceCategory(
+                  "Камера",
+                  Icons.videocam,
+                  _devices.where((d) => d.kind == 'videoinput').toList(),
+                  (id) => _switchDevice('video', id)),
+              const Divider(color: Colors.white10, height: 30),
+              _buildDeviceCategory(
+                  "Микрофон (Вход)",
+                  Icons.mic,
+                  _devices.where((d) => d.kind == 'audioinput').toList(),
+                  (id) => _switchDevice('audio', id)),
+              const Divider(color: Colors.white10, height: 30),
+              // --- НОВЫЙ БЛОК: ВЫБОР ДИНАМИКОВ ---
+              _buildDeviceCategory(
+                  "Вывод звука (Динамики)",
+                  Icons.speaker,
+                  _devices.where((d) => d.kind == 'audiooutput').toList(),
+                  (id) => _switchDevice('output', id)),
+            ],
+          ),
         ),
       ),
     );
@@ -533,11 +597,27 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   Widget _buildDeviceCategory(String title, IconData icon,
       List<MediaDeviceInfo> items, Function(String) onSelect) {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Text(title, style: const TextStyle(color: Colors.white60, fontSize: 12)),
+      Text(title,
+          style: const TextStyle(
+              color: Colors.blueAccent,
+              fontSize: 12,
+              fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      if (items.isEmpty)
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8.0),
+          child: Text("Устройства не найдены",
+              style: TextStyle(color: Colors.white38, fontSize: 13)),
+        ),
       ...items.map((d) => ListTile(
-            leading: Icon(icon, color: Colors.blueAccent),
-            title: Text(d.label,
-                style: const TextStyle(color: Colors.white, fontSize: 14)),
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(icon, color: Colors.white70, size: 20),
+            title: Text(
+                d.label.isNotEmpty
+                    ? d.label
+                    : "Устройство ${d.deviceId.substring(0, 5)}",
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                overflow: TextOverflow.ellipsis),
             onTap: () {
               onSelect(d.deviceId);
               Navigator.pop(context);
@@ -547,17 +627,24 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _switchDevice(String type, String id) async {
-    if (type == 'video') {
-      await _signaling.localStream
-          ?.getVideoTracks()
-          .firstOrNull
-          ?.applyConstraints({"deviceId": id});
-    }
-    if (type == 'audio') {
-      await _signaling.localStream
-          ?.getAudioTracks()
-          .firstOrNull
-          ?.applyConstraints({"deviceId": id});
+    try {
+      if (type == 'video') {
+        await _signaling.localStream
+            ?.getVideoTracks()
+            .firstOrNull
+            ?.applyConstraints({"deviceId": id});
+      } else if (type == 'audio') {
+        await _signaling.localStream
+            ?.getAudioTracks()
+            .firstOrNull
+            ?.applyConstraints({"deviceId": id});
+      } else if (type == 'output') {
+        // Ключевой момент: устанавливаем ID устройства вывода для удаленного потока
+        await _remoteRenderer.audioOutput(id);
+      }
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint("Switch device error: $e");
     }
   }
 

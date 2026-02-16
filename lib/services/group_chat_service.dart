@@ -1,6 +1,7 @@
 import 'package:http/http.dart' as http;
 import 'package:pocketbase/pocketbase.dart';
 import 'api_service.dart';
+import 'package:http/http.dart' as http; // Нужно для MultipartFile
 
 class GroupChatService {
   final api = ApiService();
@@ -36,26 +37,41 @@ class GroupChatService {
   }
 
   // Отправка файла (Теперь возвращает RecordModel)
-  Future<RecordModel?> sendFile(
-      String groupId, String filePath, String fileName) async {
-    final userId = api.pb.authStore.record?.id;
-    try {
-      final record = await api.pb.collection('group_messages').create(
-        body: {
-          'group_id': groupId,
-          'sender': userId,
-          'content': fileName,
-          'type': 'file',
-          'read_by': [userId],
-        },
-        files: [await http.MultipartFile.fromPath('attachment', filePath)],
-        expand: 'sender',
+  // В файле group_chat_service.dart
+  Future<void> sendFile(String groupId,
+      {String? path, List<int>? bytes, required String filename}) async {
+    final myId = api.pb.authStore.record!.id;
+
+    http.MultipartFile multipartFile;
+
+    if (bytes != null) {
+      // Логика для Web (из байтов)
+      multipartFile = http.MultipartFile.fromBytes(
+        'attachment',
+        bytes,
+        filename: filename,
       );
-      return record;
-    } catch (e) {
-      print("Ошибка отправки файла: $e");
-      return null;
+    } else if (path != null) {
+      // Логика для Desktop/Mobile (из пути)
+      multipartFile = await http.MultipartFile.fromPath(
+        'attachment',
+        path,
+        filename: filename,
+      );
+    } else {
+      throw Exception("Не переданы ни путь, ни байты файла");
     }
+
+    await api.pb.collection('group_messages').create(
+      body: {
+        "group_id": groupId,
+        "sender": myId,
+        "content": filename,
+        "type": "file",
+        "read_by": [myId],
+      },
+      files: [multipartFile],
+    );
   }
 
   Future<void> markAsRead(String messageId) async {

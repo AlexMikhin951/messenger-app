@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show kIsWeb; // Добавлено для проверки Web
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'api_service.dart';
 import '../screens/video_call_screen.dart';
@@ -8,6 +10,9 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class SignalingManager {
+  static final SignalingManager _instance = SignalingManager._internal();
+  factory SignalingManager() => _instance;
+  SignalingManager._internal();
   final api = ApiService();
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
@@ -18,6 +23,9 @@ class SignalingManager {
 
   // Очередь для ICE-кандидатов, пришедших до установки Remote Description
   List<RTCIceCandidate> _remoteCandidatesQueue = [];
+
+  // Добавь флаг, чтобы не открывать звонок дважды
+  bool _isNavigating = false;
 
   // Регулярка для фильтрации и замены локальных IP на IP сервера (динамический)
   final _internalIpRegex = RegExp(
@@ -43,6 +51,7 @@ class SignalingManager {
 
   /// Генерация конфигурации ICE на основе текущего хоста PocketBase
   Map<String, dynamic> _getIceConfig() {
+    // Для Web иногда baseUrl может быть относительным, но PocketBase обычно дает полный URL
     final uri = Uri.parse(api.pb.baseUrl);
     final String currentIp = uri.host;
 
@@ -88,7 +97,7 @@ class SignalingManager {
   };
 
   void _setConnectionListeners(BuildContext context, String? roomId) {
-    // 1. Твои проверки состояния ICE (транспорт)
+    // 1. Проверки состояния ICE (транспорт)
     _peerConnection?.onIceConnectionState = (RTCIceConnectionState state) {
       print("--- [LOG] Состояние ICE: $state ---");
       if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
@@ -97,12 +106,11 @@ class SignalingManager {
       }
     };
 
-    // 2. ИСПРАВЛЕННЫЙ БЛОК:
-    // Если onConnectionStateChange не находит, используем onConnectionState
+    // 2. Статус соединения
     _peerConnection?.onConnectionState = (RTCPeerConnectionState state) {
       print("--- [LOG] Статус соединения изменился: $state ---");
 
-      // Вызываем твой колбэк для экрана
+      // Вызываем колбэк для экрана
       if (onPeerConnectionState != null) {
         onPeerConnectionState!(state);
       }
@@ -177,7 +185,6 @@ class SignalingManager {
               RTCIceCandidate(candStr, data['sdpMid'], data['sdpMLineIndex']);
 
           // Проверяем, можно ли добавить кандидата сейчас
-          // Мы можем добавлять, если у нас уже есть RemoteDescription или мы в процессе (HaveLocalOffer/HaveRemoteOffer)
           if (_peerConnection!.signalingState !=
                   RTCSignalingState.RTCSignalingStateStable &&
               _peerConnection!.signalingState !=
@@ -230,7 +237,6 @@ class SignalingManager {
     // Список для сбора кандидатов, которые вылетят ДО создания записи в БД
     List<RTCIceCandidate> earlyCandidates = [];
 
-    // ВАЖНО: Вешаем слушатель СРАЗУ, до setLocalDescription
     _peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate.candidate != null) {
         print("--- [LOG] Пойман ранний ICE кандидат ---");
@@ -252,7 +258,6 @@ class SignalingManager {
         await _peerConnection!.createOffer(_constraints);
     String optimizedSdp = _optimizeSdp(offer.sdp!);
 
-    // После этой строки Windows начнет забивать список earlyCandidates
     await _peerConnection!
         .setLocalDescription(RTCSessionDescription(optimizedSdp, 'offer'));
 
@@ -269,7 +274,7 @@ class SignalingManager {
     print(
         "--- [LOG] Запись создана: ${record.id}. Сохраняем ранние кандидаты: ${earlyCandidates.length} ---");
 
-    // Отправляем те кандидаты, которые накопились, пока мы ждали базу
+    // Отправляем ранние кандидаты
     if (earlyCandidates.isNotEmpty) {
       final uri = Uri.parse(api.pb.baseUrl);
       final String currentIp = uri.host;
@@ -288,10 +293,10 @@ class SignalingManager {
           .update(record.id, body: {'ice_candidates_caller': candidatesJson});
     }
 
-    // Теперь запускаем стандартный обмен для всех последующих кандидатов
+    // Запускаем стандартный обмен
     _setupIceExchange(record.id, true, context);
 
-    // Подписка на Answer (без изменений)
+    // Подписка на Answer
     bool answerSet = false;
     api.pb.collection('calls').subscribe(record.id, (e) async {
       if (e.action == 'update' &&
@@ -323,22 +328,15 @@ class SignalingManager {
       print(
           "--- [LOG] Перенастройка камеры под ориентацию: ${isLandscape ? 'Landscape' : 'Portrait'} ---");
 
-      // Запрашиваем новый поток с обновленными констрейнтами (разрешением)
       MediaStream newStream = await navigator.mediaDevices.getUserMedia({
         'audio': true,
         'video': _getVideoConstraints(isLandscape),
       });
 
-      // Берем новый видео-трек
       var newVideoTrack = newStream.getVideoTracks().first;
-
-      // Заменяем трек у собеседника "на лету" без разрыва соединения
       await _replaceVideoTrack(newVideoTrack);
-
-      // Останавливаем старые треки, чтобы освободить камеру и ресурсы
       _localStream?.getTracks().forEach((track) => track.stop());
 
-      // Обновляем локальные ссылки и отображение в UI
       _localStream = newStream;
       local.srcObject = _localStream;
 
@@ -349,12 +347,10 @@ class SignalingManager {
   }
 
   /// Присоединение к звонку (Receiver)
-  /// Исправленный метод присоединения к звонку (Receiver)
   Future<void> joinCall(String roomId, RTCVideoRenderer remoteRenderer,
       BuildContext context) async {
     print("--- [LOG] Присоединение к звонку (Receiver) ---");
 
-    // Очищаем очередь перед новым звонком
     _remoteCandidatesQueue.clear();
 
     _peerConnection = await createPeerConnection(_getIceConfig());
@@ -371,7 +367,6 @@ class SignalingManager {
         ?.getTracks()
         .forEach((track) => _peerConnection?.addTrack(track, _localStream!));
 
-    // 1. Сначала настраиваем обмен (подписку на кандидатов)
     _setupIceExchange(roomId, false, context);
 
     final callData = await api.pb.collection('calls').getOne(roomId);
@@ -380,14 +375,11 @@ class SignalingManager {
         RTCSignalingState.RTCSignalingStateStable) {
       print("--- [LOG] Установка Remote Offer ---");
 
-      // 2. Устанавливаем Offer от Caller
       await _peerConnection!.setRemoteDescription(
           RTCSessionDescription(callData.data['offer'], 'offer'));
 
-      // 3. КРИТИЧЕСКИ ВАЖНО: Сразу после установки Offer выгребаем очередь
       await _processQueuedCandidates();
 
-      // 4. Создаем и устанавливаем Answer
       RTCSessionDescription answer =
           await _peerConnection!.createAnswer(_constraints);
       String optimizedSdp = _optimizeSdp(answer.sdp!);
@@ -395,7 +387,6 @@ class SignalingManager {
       await _peerConnection!
           .setLocalDescription(RTCSessionDescription(optimizedSdp, 'answer'));
 
-      // 5. Отправляем Answer в базу
       await api.pb.collection('calls').update(roomId,
           body: {'answer': optimizedSdp, 'status': 'connected'});
 
@@ -405,6 +396,7 @@ class SignalingManager {
   }
 
   /// Переключение на захват экрана и обратно
+  /// ИСПРАВЛЕННАЯ ВЕРСИЯ ДЛЯ WEB и WINDOWS
   Future<void> switchScreenShare(RTCVideoRenderer localRenderer, bool enable,
       {BuildContext? context}) async {
     try {
@@ -412,7 +404,15 @@ class SignalingManager {
       if (enable) {
         print("--- [LOG] Запрос на захват экрана ---");
 
-        if (WebRTC.platformIsWindows || WebRTC.platformIsMacOS) {
+        if (kIsWeb) {
+          // --- ЛОГИКА ДЛЯ WEB ---
+          // В вебе браузер сам показывает диалог выбора окна/вкладки
+          newStream = await navigator.mediaDevices.getDisplayMedia({
+            'video': true,
+            'audio': false,
+          });
+        } else if (WebRTC.platformIsWindows || WebRTC.platformIsMacOS) {
+          // --- ЛОГИКА ДЛЯ WINDOWS/MAC ---
           if (context != null) {
             final sources = await desktopCapturer
                 .getSources(types: [SourceType.Window, SourceType.Screen]);
@@ -459,7 +459,7 @@ class SignalingManager {
         }
       } else {
         print("--- [LOG] Возврат к камере ---");
-        // При возврате проверяем ориентацию, чтобы не получить растянутое видео
+        // При возврате проверяем ориентацию
         final isLandscape = context != null &&
             MediaQuery.of(context).orientation == Orientation.landscape;
 
@@ -470,13 +470,8 @@ class SignalingManager {
       }
 
       if (newStream != null && newStream.getVideoTracks().isNotEmpty) {
-        // Заменяем трек в PeerConnection
         await _replaceVideoTrack(newStream.getVideoTracks().first);
-
-        // Очищаем старый поток
         _localStream?.getTracks().forEach((track) => track.stop());
-
-        // Обновляем локальный стрим
         _localStream = newStream;
         localRenderer.srcObject = _localStream;
       }
@@ -568,8 +563,7 @@ class SignalingManager {
       }
     }
 
-    sendPulse(); // Сразу при старте
-    // Каждые 7 секунд — это даст запас, если один пакет потеряется
+    sendPulse();
     _heartbeatTimer =
         Timer.periodic(const Duration(seconds: 7), (timer) => sendPulse());
   }
@@ -594,33 +588,25 @@ class SignalingManager {
   Future<void> hangUp(String? roomId) async {
     print("--- [LOG] Завершение звонка... ---");
 
-    // 1. Сбрасываем слушатель, чтобы экран не пытался закрыться дважды
     onPeerConnectionState = null;
 
-    // 2. Останавливаем камеру и микрофон
     _localStream?.getTracks().forEach((track) => track.stop());
     _localStream = null;
 
-    // 3. Закрываем само соединение
     await _peerConnection?.close();
     _peerConnection = null;
 
-    // 4. Удаляем комнату из базы данных (если roomId передан)
     if (roomId != null) {
       api.pb.collection('calls').unsubscribe(roomId).catchError((_) => null);
       await api.pb.collection('calls').delete(roomId).catchError((_) => null);
     }
   }
 
-  /// Начинает слушать уведомления от ntfy.sh
-  // Внутри класса SignalingManager
-
   void startListeningNotifications() async {
-    // Используем ApiService для доступа к PocketBase
+    // В вебе работа с SSE может блокироваться CORS, но код оставляем валидным
     final user = ApiService().pb.authStore.model;
     if (user == null) return;
 
-    // Если у тебя топик строится по username (телефону), как в прошлых логах:
     final String phone =
         user.getStringValue("username").replaceAll(RegExp(r'\D'), '');
     final String topic = "family_msg_$phone";
@@ -637,70 +623,70 @@ class SignalingManager {
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
-        final trimmedLine = line.trim(); // Убираем лишние пробелы и \r
+        final trimmedLine = line.trim();
 
-        // 1. Игнорируем всё, что не начинается с data:
-        if (!trimmedLine.startsWith('data:')) {
-          return;
-        }
+        if (!trimmedLine.startsWith('data:')) return;
 
         try {
-          // 2. Извлекаем JSON более надежно
-          // Находим первое вхождение '{' и берем всё до конца
           final int jsonStartIndex = trimmedLine.indexOf('{');
-          if (jsonStartIndex == -1) return; // Это не JSON
+          if (jsonStartIndex == -1) return;
 
           final String jsonPart = trimmedLine.substring(jsonStartIndex);
           final data = jsonDecode(jsonPart);
 
-          // 3. Проверяем, что это не keepalive внутри JSON
           if (data['event'] == 'keepalive') return;
 
           print("--- [LOG] Валидное уведомление: ${data['event']} ---");
 
-          // ТУТ ТВОЯ ЛОГИКА ОБРАБОТКИ (например, передача в стрим или вызов функции)
+          // Вызов уведомления
+          if (data['title'] != null && data['message'] != null) {
+            _showWindowsNotification(data['title'], data['message']);
+          }
         } catch (e) {
           print("--- [ERROR] Ошибка парсинга: $e | Строка: $trimmedLine ---");
         }
       }, onError: (e) {
         print("--- [ERROR] Ошибка стрима SSE: $e ---");
-        // Реконнект через 5 секунд при ошибке
-        Future.delayed(
-            const Duration(seconds: 5), () => startListeningNotifications());
+        _reconnect(() => startListeningNotifications());
       });
     } catch (e) {
       print("--- [ERROR] Не удалось подключиться к ntfy: $e ---");
     }
   }
 
-// Вспомогательный метод для чистого реконнекта
   void _reconnect(VoidCallback callback) {
     Future.delayed(const Duration(seconds: 5), callback);
   }
 
+  // ОБНОВЛЕННЫЙ МЕТОД УВЕДОМЛЕНИЙ
   void _showWindowsNotification(String title, String body) {
-    LocalNotification notification = LocalNotification(
-      title: title,
-      body: body,
-      silent: false, // будет звук
-    );
-    notification.show();
+    // В Вебе local_notifier может не работать или требовать инициализации,
+    // которую мы не можем гарантировать. Просто логируем.
+    if (kIsWeb) {
+      print("--- [WEB NOTIFICATION] $title: $body ---");
+      return;
+    }
+
+    // Для Desktop
+    try {
+      LocalNotification notification = LocalNotification(
+        title: title,
+        body: body,
+        silent: false,
+      );
+      notification.show();
+    } catch (e) {
+      print("Ошибка показа уведомления: $e");
+    }
   }
-  // Внутри класса SignalingManager добавь:
-
-  // lib/services/signaling_manager.dart
-
-// Добавь флаг, чтобы не открывать звонок дважды
-  bool _isNavigating = false;
 
   Future<void> checkActiveCalls(BuildContext context) async {
-    if (_isNavigating) return; // Если уже в процессе перехода, выходим
+    if (_isNavigating) return;
 
     try {
       final myId = api.pb.authStore.record?.id;
       if (myId == null) return;
 
-      // Ищем именно тот звонок, который мы видели в ПБ на твоем скриншоте
       final records = await api.pb.collection('calls').getList(
             page: 1,
             perPage: 1,
@@ -711,7 +697,6 @@ class SignalingManager {
       if (records.items.isNotEmpty) {
         final call = records.items.first;
 
-        // Проверяем, не открыт ли уже экран звонка
         bool isAlreadyOnCall = false;
         Navigator.popUntil(context, (route) {
           if (route.settings.name == '/call') isAlreadyOnCall = true;
@@ -721,7 +706,6 @@ class SignalingManager {
         if (!isAlreadyOnCall) {
           _isNavigating = true;
 
-          // Используем pushNamed, чтобы соответствовать onGenerateRoute в main.dart
           await Navigator.pushNamed(
             context,
             '/call',
