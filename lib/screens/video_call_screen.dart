@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb; // Добавлено для Web
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:pocketbase/pocketbase.dart';
@@ -40,7 +41,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   late bool _hasAccepted;
   bool _isRemoteVideoReady = false;
   bool _showControls = true;
-  bool _isInitialized = false; // Флаг готовности рендереров
+  bool _isInitialized = false;
 
   bool _isMicOn = true;
   bool _isCameraOn = true;
@@ -58,7 +59,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _initialize() async {
-    // 1. Сначала инициализируем рендереры
     await _localRenderer.initialize();
     await _remoteRenderer.initialize();
 
@@ -68,21 +68,19 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     await _loadCallerInfo();
 
-    // 2. Настройка звука
-    if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+    // ПРАВКА: Безопасная проверка платформы для звука
+    if (!kIsWeb &&
+        (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
       _loadDevices();
     } else {
       Helper.setSpeakerphoneOn(_isSpeakerOn);
     }
 
-    // 3. Обработка логики звонка
     if (widget.isIncoming) {
       _playRingtone();
       await Future.delayed(const Duration(milliseconds: 500));
-      // Важно: начинаем слушать удаление комнаты сразу
       if (_activeRoomId != null) _listenToCallTermination();
     } else {
-      // Для исходящего сразу запускаем процесс
       await _startCall();
     }
 
@@ -98,8 +96,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    // Сначала открываем медиа (камеру/микрофон)
-    // Это критически важно сделать ДО joinCall или createCall, чтобы избежать Race Condition
     await _signaling.openUserMedia(
         _localRenderer, _remoteRenderer, isLandscape);
 
@@ -114,7 +110,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     if (widget.isIncoming && _activeRoomId != null) {
       try {
-        // Присоединяемся к существующей сессии
         await _signaling.joinCall(_activeRoomId!, _remoteRenderer, context);
       } catch (e) {
         debugPrint("Error joining call: $e");
@@ -122,7 +117,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       }
     } else {
       try {
-        // Создаем новую сессию
         _activeRoomId = await _signaling.createCall(
             widget.receiverId, _remoteRenderer, context);
         if (_activeRoomId != null) {
@@ -142,7 +136,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     if (!mounted) return;
     _audioPlayer.stop();
 
-    // Выносим hangUp из try-finally для надежности
     _signaling
         .hangUp(_activeRoomId)
         .catchError((e) => debugPrint("Hangup error: $e"));
@@ -157,8 +150,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     }
   }
 
-  // --- UI Секция ---
-
   @override
   Widget build(BuildContext context) {
     if (!_isInitialized) {
@@ -171,7 +162,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // Удаленное видео
           Positioned.fill(
             child: _isRemoteVideoReady
                 ? RTCVideoView(_remoteRenderer,
@@ -179,8 +169,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                         RTCVideoViewObjectFit.RTCVideoViewObjectFitContain)
                 : _buildPlaceholder(),
           ),
-
-          // Детектор нажатий для скрытия контролов
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
@@ -191,7 +179,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
               child: Container(color: Colors.transparent),
             ),
           ),
-
           if (_hasAccepted) ...[
             if (_isCameraOn) _buildLocalPreview(),
             _buildTopBar(),
@@ -203,7 +190,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
               child: Center(child: _buildModernControlPanel()),
             ),
           ],
-
           if (widget.isIncoming && !_hasAccepted) _buildIncomingCallUI(),
         ],
       ),
@@ -243,7 +229,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                 },
               ),
               const SizedBox(width: 12),
-              if (Platform.isWindows || Platform.isMacOS) ...[
+              // ПРАВКА: Проверка Web для кнопок шаринга и настроек
+              if (!kIsWeb && (Platform.isWindows || Platform.isMacOS)) ...[
                 _buildRoundBtn(
                   icon: Icons.monitor,
                   active: _isScreenSharing,
@@ -324,8 +311,11 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   Widget _buildLocalPreview() {
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
-    double width = Platform.isWindows ? 200.0 : (isLandscape ? 180.0 : 120.0);
-    double height = Platform.isWindows ? 120.0 : (isLandscape ? 120.0 : 180.0);
+
+    // ПРАВКА: Безопасные размеры для Web
+    bool isWindows = !kIsWeb && Platform.isWindows;
+    double width = isWindows ? 200.0 : (isLandscape ? 180.0 : 120.0);
+    double height = isWindows ? 120.0 : (isLandscape ? 120.0 : 180.0);
 
     return Positioned(
       top: 60,
@@ -490,8 +480,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
   Future<void> _playRingtone() async {
     try {
-      // В ЭТОМ БЛОКЕ ВООБЩЕ НЕТ СЛОВА 'const'
-      // Это гарантирует, что ошибка "const_with_non_const" исчезнет
       await _audioPlayer.setAudioContext(AudioContext(
         android: AudioContextAndroid(
           contentType: AndroidContentType.sonification,
@@ -504,8 +492,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       ));
 
       await _audioPlayer.setReleaseMode(ReleaseMode.loop);
-
-      // Проверь, что файл называется именно ringtone.mp3
       await _audioPlayer.play(AssetSource('sounds/Ring.mp3'));
 
       debugPrint("Рингтон запущен успешно");

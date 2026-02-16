@@ -1,5 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show kIsWeb; // Добавлено для безопасной проверки Web
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:local_notifier/local_notifier.dart';
 
@@ -14,7 +16,8 @@ import 'screens/video_call_screen.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  if (Platform.isWindows) {
+  // ПРАВКА: Проверка kIsWeb предотвращает вызов Platform.isWindows в браузере
+  if (!kIsWeb && Platform.isWindows) {
     await localNotifier.setup(
       appName: 'Family Messenger',
       shortcutPolicy: ShortcutPolicy.requireCreate,
@@ -35,7 +38,8 @@ void main() async {
       await api.pb.collection('users').authWithPassword(savedPhone, savedPass);
       SignalingManager().startHeartbeat();
 
-      if (Platform.isWindows) {
+      // ПРАВКА: Добавлена проверка на Web
+      if (!kIsWeb && Platform.isWindows) {
         SignalingManager().startListeningNotifications();
       }
       initialScreen = const ContactsScreen();
