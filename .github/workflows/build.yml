@@ -1,28 +1,50 @@
-name: Flutter Build Linux
+name: Flutter AppImage Build
 on: [push, workflow_dispatch]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04 # Используем более старую базу для лучшей совместимости
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Dependencies
+      - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev libsecret-1-dev libjsoncpp-dev libnotify-dev libasound2-dev libpulse-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libjsoncpp-dev libnotify-dev libasound2-dev libpulse-dev
 
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
           
-      - name: Build Application
+      - name: Build Linux Release
         run: |
           flutter pub get
           flutter build linux --release
 
-      - name: Upload Build Artifact
+      # Упаковка в AppImage
+      - name: Package AppImage
+        uses: AppImageCrafters/build-appimage-action@v1
+        with:
+          recipe: |
+            version: 1
+            AppDir:
+              path: build/linux/x64/release/bundle
+              app_info:
+                id: com.example.new_messenger
+                name: new_messenger
+                icon: utilities-terminal
+                exec: new_messenger
+              apt:
+                arch: amd64
+                dist: jammy
+                components: [main, universe]
+                packages: [libgtk-3-0, libglib2.0-0, libsecret-1-0, libnotify4, libasound2, libpulse0]
+            AppImage:
+              arch: x64
+              update-information: none
+
+      - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: linux-messenger-app
-          path: build/linux/x64/release/bundle/
+          name: messenger-universal-app
+          path: "*.AppImage"
