@@ -91,8 +91,16 @@ class _AuthScreenState extends State<AuthScreen> {
   // Вынес инициализацию в отдельный метод
   void _initSignaling() {
     try {
+      // 1. Запускаем пульс "Я онлайн"
       SignalingManager().startHeartbeat();
-      // Слушаем уведомления только на десктопе
+
+      // 2. ВАЖНО: Включаем прослушку входящих звонков
+      // (так как main.dart делает это только при авто-входе)
+      if (mounted) {
+        SignalingManager().initCallListener(context);
+      }
+
+      // 3. Слушаем уведомления (только Desktop)
       if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
         SignalingManager().startListeningNotifications();
       }

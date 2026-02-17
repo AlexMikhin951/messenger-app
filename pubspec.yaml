@@ -20,6 +20,7 @@ dependencies:
   file_picker: ^10.3.10
   audioplayers: ^6.5.1
   window_manager: ^0.5.1
+  crypto: ^3.0.3
 
 dev_dependencies:
   flutter_test:

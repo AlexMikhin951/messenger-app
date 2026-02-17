@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart'
-    show kIsWeb; // Добавлено для проверки Web
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'api_service.dart';
 import '../screens/video_call_screen.dart';
@@ -13,80 +12,68 @@ class SignalingManager {
   static final SignalingManager _instance = SignalingManager._internal();
   factory SignalingManager() => _instance;
   SignalingManager._internal();
+
   final api = ApiService();
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
 
-  // Геттер для управления локальным потоком из UI
   MediaStream? get localStream => _localStream;
   Function(RTCPeerConnectionState)? onPeerConnectionState;
 
-  // Очередь для ICE-кандидатов, пришедших до установки Remote Description
   List<RTCIceCandidate> _remoteCandidatesQueue = [];
-
-  // Добавь флаг, чтобы не открывать звонок дважды
   bool _isNavigating = false;
 
-  // Регулярка для фильтрации и замены локальных IP на IP сервера (динамический)
+  // Регулярка для замены локальных IP на IP сервера (если нужно)
   final _internalIpRegex = RegExp(
       r'\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b');
 
-  /// Вспомогательный метод для получения настроек видео в зависимости от ориентации
   Map<String, dynamic> _getVideoConstraints(bool isLandscape) {
-    // Если горизонтально: 1920x1080. Если вертикально: 1080x1920.
-    double width = isLandscape ? 1920 : 1080;
-    double height = isLandscape ? 1080 : 1920;
-    double ratio = width / height;
-
-    print(
-        "--- [LOG] Констрейнты видео: ${width.toInt()}x${height.toInt()} (ratio: ${ratio.toStringAsFixed(2)}) ---");
+    double width =
+        isLandscape ? 1280 : 720; // Оптимизировал разрешение для стабильности
+    double height = isLandscape ? 720 : 1280;
 
     return {
       'facingMode': 'user',
       'width': {'ideal': width},
       'height': {'ideal': height},
-      'aspectRatio': ratio,
     };
   }
 
-  /// Генерация конфигурации ICE на основе текущего хоста PocketBase
+  // --- ИСПРАВЛЕНО: Берем IP из конфига ApiService ---
   Map<String, dynamic> _getIceConfig() {
-    // Для Web иногда baseUrl может быть относительным, но PocketBase обычно дает полный URL
-    final uri = Uri.parse(api.pb.baseUrl);
-    final String currentIp = uri.host;
+    // Получаем IP из загруженного конфига
+    final String serverIp = api.config?.ip ?? '0.0.0.0';
+    print("--- [LOG] ICE Config для IP: $serverIp (TCP Turn) ---");
 
-    print("--- [LOG] Конфигурация ICE для IP: $currentIp ---");
     return {
       'iceServers': [
-        {'urls': 'stun:$currentIp:3478'},
+        // Используем TCP для обхода блокировок UDP
         {
-          'urls': 'turn:$currentIp:3478',
-          'username': 'family',
-          'credential': 'strongpassword123',
+          'urls': 'turn:$serverIp:3478?transport=tcp',
+          'username': 'myuser', // <-- ВАЖНО: Укажите юзера из turnserver.conf
+          'credential':
+              'mypassword', // <-- ВАЖНО: Укажите пароль из turnserver.conf
         },
-        {'urls': 'stun:stun.l.google.com:19302'},
+        {'urls': 'stun:$serverIp:3478'}, // Наш STUN
+        {'urls': 'stun:stun.l.google.com:19302'}, // Резервный STUN
       ],
       'sdpSemantics': 'unified-plan',
       'iceCandidatePoolSize': 10,
     };
   }
 
-  /// Оптимизация SDP: подмена локальных адресов на внешний IP сервера + битрейт
   String _optimizeSdp(String sdp) {
-    final uri = Uri.parse(api.pb.baseUrl);
-    final String currentIp = uri.host;
+    final String serverIp = api.config?.ip ?? '127.0.0.1';
 
     String fixedSdp = sdp.replaceAll('IN IP4 127.0.0.1', 'IN IP4 0.0.0.0');
 
     fixedSdp = fixedSdp.replaceAllMapped(_internalIpRegex, (match) {
-      print(
-          "--- [LOG] SDP: Замена внутреннего IP ${match.group(0)} -> $currentIp ---");
-      return currentIp;
+      return serverIp;
     });
 
-    // Форсируем высокий битрейт для HD качества
+    // Оптимизация битрейта (старт 1000, макс 2500 кбит/с)
     fixedSdp = fixedSdp.replaceAll('a=fmtp:96',
-        'a=fmtp:96;x-google-max-bitrate=3500;x-google-min-bitrate=1000;x-google-start-bitrate=2000');
+        'a=fmtp:96;x-google-max-bitrate=2500;x-google-min-bitrate=500;x-google-start-bitrate=1000');
 
     return fixedSdp;
   }
@@ -97,27 +84,18 @@ class SignalingManager {
   };
 
   void _setConnectionListeners(BuildContext context, String? roomId) {
-    // 1. Проверки состояния ICE (транспорт)
     _peerConnection?.onIceConnectionState = (RTCIceConnectionState state) {
-      print("--- [LOG] Состояние ICE: $state ---");
-      if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
-          state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
-        print("--- [LOG] Внимание: Соединение нестабильно ---");
-      }
+      print("--- [LOG] ICE State: $state ---");
     };
 
-    // 2. Статус соединения
     _peerConnection?.onConnectionState = (RTCPeerConnectionState state) {
-      print("--- [LOG] Статус соединения изменился: $state ---");
-
-      // Вызываем колбэк для экрана
+      print("--- [LOG] Connection State: $state ---");
       if (onPeerConnectionState != null) {
         onPeerConnectionState!(state);
       }
     };
   }
 
-  /// Обработка накопившихся ICE-кандидатов после установки SDP
   Future<void> _processQueuedCandidates() async {
     if (_peerConnection == null) return;
 
@@ -125,20 +103,17 @@ class SignalingManager {
             RTCSignalingState.RTCSignalingStateHaveRemoteOffer ||
         _peerConnection!.signalingState ==
             RTCSignalingState.RTCSignalingStateStable) {
-      print(
-          "--- [LOG] Обработка очереди ICE (${_remoteCandidatesQueue.length} шт.) ---");
       for (var candidate in _remoteCandidatesQueue) {
         try {
           await _peerConnection!.addCandidate(candidate);
         } catch (e) {
-          print("--- [ERROR] Ошибка добавления из очереди: $e ---");
+          print("--- [ERROR] Queue candidate error: $e ---");
         }
       }
       _remoteCandidatesQueue.clear();
     }
   }
 
-  /// Логика обмена ICE-кандидатами через PocketBase
   void _setupIceExchange(
       String roomId, bool isCaller, BuildContext context) async {
     final myField =
@@ -146,18 +121,17 @@ class SignalingManager {
     final remoteField =
         isCaller ? 'ice_candidates_receiver' : 'ice_candidates_caller';
 
-    final uri = Uri.parse(api.pb.baseUrl);
-    final String currentIp = uri.host;
+    // Используем IP из конфига
+    final String serverIp = api.config?.ip ?? '127.0.0.1';
     final Set<String> addedCandidates = {};
 
     _peerConnection?.onIceCandidate = (RTCIceCandidate candidate) async {
       if (candidate.candidate == null) return;
 
       String candidateStr = candidate.candidate!
-          .replaceAllMapped(_internalIpRegex, (match) => currentIp);
+          .replaceAllMapped(_internalIpRegex, (match) => serverIp);
 
       try {
-        // Используем транзакционную логику: получаем актуальный список и пушим
         final call = await api.pb.collection('calls').getOne(roomId);
         List candidates = List.from(call.data[myField] ?? []);
         candidates.add({
@@ -168,13 +142,11 @@ class SignalingManager {
         await api.pb
             .collection('calls')
             .update(roomId, body: {myField: candidates});
-        print("--- [LOG] Локальный ICE отправлен в базу ---");
       } catch (e) {
-        print("--- [ERROR] Ошибка отправки ICE: $e ---");
+        print("--- [ERROR] ICE send error: $e ---");
       }
     };
 
-    // Внутренняя функция обработки удаленных кандидатов
     Future<void> addRemoteCandidates(List? candidates) async {
       if (candidates == null || _peerConnection == null) return;
 
@@ -184,26 +156,17 @@ class SignalingManager {
           RTCIceCandidate candidate =
               RTCIceCandidate(candStr, data['sdpMid'], data['sdpMLineIndex']);
 
-          // Проверяем, можно ли добавить кандидата сейчас
           if (_peerConnection!.signalingState !=
                   RTCSignalingState.RTCSignalingStateStable &&
               _peerConnection!.signalingState !=
                   RTCSignalingState.RTCSignalingStateClosed) {
-            // Если Offer еще не установлен — в очередь
             if (await _peerConnection!.getRemoteDescription() == null) {
               _remoteCandidatesQueue.add(candidate);
-              print("--- [LOG] ICE в очереди (ждем setRemoteDescription) ---");
             } else {
-              try {
-                await _peerConnection!.addCandidate(candidate);
-                print("--- [LOG] Удаленный ICE успешно добавлен ---");
-              } catch (e) {
-                print("--- [ERROR] Ошибка addCandidate: $e ---");
-              }
+              await _peerConnection!.addCandidate(candidate);
             }
           } else if (_peerConnection!.signalingState ==
               RTCSignalingState.RTCSignalingStateStable) {
-            // Если уже Stable — добавляем сразу
             await _peerConnection!.addCandidate(candidate);
           } else {
             _remoteCandidatesQueue.add(candidate);
@@ -213,33 +176,28 @@ class SignalingManager {
       }
     }
 
-    // Подписка на обновления
     api.pb.collection('calls').subscribe(roomId, (e) {
       if (e.action == 'update') {
         addRemoteCandidates(e.record?.data[remoteField]);
       }
     });
 
-    // Проверка начальных кандидатов
     final initialCall =
         await api.pb.collection('calls').getOne(roomId).catchError((_) => null);
     if (initialCall != null) addRemoteCandidates(initialCall.data[remoteField]);
   }
 
-  /// Создание звонка (Caller)
   Future<String> createCall(String receiverId, RTCVideoRenderer remoteRenderer,
       BuildContext context) async {
-    print("--- [LOG] Инициализация звонка (Caller) ---");
+    print("--- [LOG] Create Call (Caller) ---");
 
     _peerConnection = await createPeerConnection(_getIceConfig());
     _setConnectionListeners(context, null);
 
-    // Список для сбора кандидатов, которые вылетят ДО создания записи в БД
     List<RTCIceCandidate> earlyCandidates = [];
 
     _peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate.candidate != null) {
-        print("--- [LOG] Пойман ранний ICE кандидат ---");
         earlyCandidates.add(candidate);
       }
     };
@@ -261,7 +219,6 @@ class SignalingManager {
     await _peerConnection!
         .setLocalDescription(RTCSessionDescription(optimizedSdp, 'offer'));
 
-    // Теперь создаем запись в базе
     final record = await api.pb.collection('calls').create(body: {
       'caller': api.pb.authStore.record!.id,
       'receiver': receiverId,
@@ -271,18 +228,13 @@ class SignalingManager {
       'ice_candidates_receiver': [],
     });
 
-    print(
-        "--- [LOG] Запись создана: ${record.id}. Сохраняем ранние кандидаты: ${earlyCandidates.length} ---");
-
-    // Отправляем ранние кандидаты
     if (earlyCandidates.isNotEmpty) {
-      final uri = Uri.parse(api.pb.baseUrl);
-      final String currentIp = uri.host;
+      final String serverIp = api.config?.ip ?? '127.0.0.1';
 
       List candidatesJson = earlyCandidates
           .map((c) => {
                 'candidate': c.candidate!
-                    .replaceAllMapped(_internalIpRegex, (match) => currentIp),
+                    .replaceAllMapped(_internalIpRegex, (match) => serverIp),
                 'sdpMid': c.sdpMid,
                 'sdpMLineIndex': c.sdpMLineIndex,
               })
@@ -293,10 +245,8 @@ class SignalingManager {
           .update(record.id, body: {'ice_candidates_caller': candidatesJson});
     }
 
-    // Запускаем стандартный обмен
     _setupIceExchange(record.id, true, context);
 
-    // Подписка на Answer
     bool answerSet = false;
     api.pb.collection('calls').subscribe(record.id, (e) async {
       if (e.action == 'update' &&
@@ -323,11 +273,7 @@ class SignalingManager {
   Future<void> updateVideoOrientation(
       RTCVideoRenderer local, bool isLandscape) async {
     if (_localStream == null) return;
-
     try {
-      print(
-          "--- [LOG] Перенастройка камеры под ориентацию: ${isLandscape ? 'Landscape' : 'Portrait'} ---");
-
       MediaStream newStream = await navigator.mediaDevices.getUserMedia({
         'audio': true,
         'video': _getVideoConstraints(isLandscape),
@@ -336,29 +282,23 @@ class SignalingManager {
       var newVideoTrack = newStream.getVideoTracks().first;
       await _replaceVideoTrack(newVideoTrack);
       _localStream?.getTracks().forEach((track) => track.stop());
-
       _localStream = newStream;
       local.srcObject = _localStream;
-
-      print("--- [LOG] Ориентация потока успешно обновлена ---");
     } catch (e) {
-      print("--- [ERROR] Не удалось обновить ориентацию: $e ---");
+      print("--- [ERROR] Orientation update error: $e ---");
     }
   }
 
-  /// Присоединение к звонку (Receiver)
   Future<void> joinCall(String roomId, RTCVideoRenderer remoteRenderer,
       BuildContext context) async {
-    print("--- [LOG] Присоединение к звонку (Receiver) ---");
+    print("--- [LOG] Join Call (Receiver) ---");
 
     _remoteCandidatesQueue.clear();
-
     _peerConnection = await createPeerConnection(_getIceConfig());
     _setConnectionListeners(context, roomId);
 
     _peerConnection?.onTrack = (RTCTrackEvent event) {
       if (event.streams.isNotEmpty) {
-        print("--- [LOG] ВИДЕОПОТОК ПОЛУЧЕН (Receiver) ---");
         scheduleMicrotask(() => remoteRenderer.srcObject = event.streams[0]);
       }
     };
@@ -373,8 +313,6 @@ class SignalingManager {
 
     if (_peerConnection?.signalingState !=
         RTCSignalingState.RTCSignalingStateStable) {
-      print("--- [LOG] Установка Remote Offer ---");
-
       await _peerConnection!.setRemoteDescription(
           RTCSessionDescription(callData.data['offer'], 'offer'));
 
@@ -389,9 +327,6 @@ class SignalingManager {
 
       await api.pb.collection('calls').update(roomId,
           body: {'answer': optimizedSdp, 'status': 'connected'});
-
-      print(
-          "--- [LOG] Answer установлен и отправлен. Состояние: ${_peerConnection?.signalingState} ---");
     }
   }
 
@@ -577,28 +512,23 @@ class SignalingManager {
         'video': _getVideoConstraints(isLandscape),
       });
       local.srcObject = _localStream;
-      print(
-          "--- [LOG] Камера включена. Режим: ${isLandscape ? 'Landscape' : 'Portrait'} ---");
     } catch (e) {
-      print("--- [ERROR] Ошибка доступа к камере: $e ---");
+      print("--- [ERROR] Camera access error: $e ---");
     }
   }
 
-  /// Завершение звонка и очистка ресурсов
   Future<void> hangUp(String? roomId) async {
-    print("--- [LOG] Завершение звонка... ---");
-
     onPeerConnectionState = null;
-
     _localStream?.getTracks().forEach((track) => track.stop());
     _localStream = null;
-
     await _peerConnection?.close();
     _peerConnection = null;
 
     if (roomId != null) {
       api.pb.collection('calls').unsubscribe(roomId).catchError((_) => null);
-      await api.pb.collection('calls').delete(roomId).catchError((_) => null);
+      try {
+        await api.pb.collection('calls').delete(roomId);
+      } catch (_) {}
     }
   }
 
@@ -660,23 +590,11 @@ class SignalingManager {
 
   // ОБНОВЛЕННЫЙ МЕТОД УВЕДОМЛЕНИЙ
   void _showWindowsNotification(String title, String body) {
-    // В Вебе local_notifier может не работать или требовать инициализации,
-    // которую мы не можем гарантировать. Просто логируем.
-    if (kIsWeb) {
-      print("--- [WEB NOTIFICATION] $title: $body ---");
-      return;
-    }
-
-    // Для Desktop
+    if (kIsWeb) return;
     try {
-      LocalNotification notification = LocalNotification(
-        title: title,
-        body: body,
-        silent: false,
-      );
-      notification.show();
+      LocalNotification(title: title, body: body).show();
     } catch (e) {
-      print("Ошибка показа уведомления: $e");
+      print("Notify Error: $e");
     }
   }
 
