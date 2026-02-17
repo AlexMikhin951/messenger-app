@@ -3,6 +3,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pocketbase/pocketbase.dart';
 import '../services/api_service.dart';
 import '../screens/group_chat_screen.dart';
+import '../services/signaling_manager.dart';
 import 'chat_screen.dart';
 import 'auth_screen.dart';
 
@@ -30,9 +31,23 @@ class _ContactsScreenState extends State<ContactsScreen> {
   @override
   void initState() {
     super.initState();
+
+    // 1. Существующие загрузки
     _initialLoad();
     _subscribeToGlobalMessages();
     _subscribeToGroupMessages();
+
+    // 2. Инициализация слушателя звонков (SignalingManager — синглтон, поэтому через скобки)
+    final signaling = SignalingManager();
+
+    // Начинаем слушать входящие звонки в реальном времени
+    signaling.initCallListener(context);
+
+    // Проверяем, нет ли уже активного звонка прямо сейчас (на случай перезахода)
+    signaling.checkActiveCalls(context);
+
+    // Запускаем пульс (чтобы другие видели ваш статус Online)
+    signaling.startHeartbeat();
   }
 
   Future<void> _initialLoad() async {
