@@ -1,6 +1,7 @@
 import 'dart:io'; // Для Platform
 import 'package:flutter/foundation.dart'; // Для kIsWeb
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // ДОБАВЛЕНО для буфера обмена
 import 'package:pocketbase/pocketbase.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -41,6 +42,20 @@ class _ChatScreenState extends State<ChatScreen> {
     await _loadMessages();
     await _markAsRead();
     _subscribeToMessages();
+  }
+
+  // Метод для копирования текста в буфер обмена
+  void _copyToClipboard(String text) {
+    Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Скопировано в буфер обмена"),
+          duration: Duration(seconds: 1),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   Future<void> _markAsRead() async {
@@ -184,8 +199,16 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final fileUrl = api.pb.files.getUrl(m, attachmentName).toString();
       final uri = Uri.parse(fileUrl);
+
+      // На мобильных устройствах externalApplication иногда дает сбой,
+      // поэтому добавляем альтернативный режим запуска.
       if (await canLaunchUrl(uri)) {
-        await launchUrl(uri, mode: LaunchMode.externalApplication);
+        await launchUrl(uri,
+            mode: kIsWeb
+                ? LaunchMode.platformDefault
+                : LaunchMode.externalApplication);
+      } else {
+        throw 'Could not launch $fileUrl';
       }
     } catch (e) {
       debugPrint("Ошибка при работе с файлом: $e");
@@ -290,7 +313,6 @@ class _ChatScreenState extends State<ChatScreen> {
         margin: const EdgeInsets.symmetric(vertical: 12),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         decoration: BoxDecoration(
-          // Цвет звонка: красный для пропущенного, зеленый для успешного
           color: isMissed
               ? Colors.red.withOpacity(0.1)
               : Colors.green.withOpacity(0.1),
@@ -333,7 +355,12 @@ class _ChatScreenState extends State<ChatScreen> {
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
+        // Обычное нажатие для открытия файла
         onTap: type == 'file' ? () => _handleFileTap(m) : null,
+        // Долгое нажатие для копирования (Mobile)
+        onLongPress: () => _copyToClipboard(content),
+        // Нажатие правой кнопкой мыши (Desktop)
+        onSecondaryTap: () => _copyToClipboard(content),
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 4),
           padding: const EdgeInsets.all(12),
@@ -385,8 +412,6 @@ class _ChatScreenState extends State<ChatScreen> {
                     style: TextStyle(
                         color: isMe ? Colors.white : Colors.black87,
                         fontSize: 16)),
-
-              // Индикатор прочтения (только для моих сообщений)
               if (isMe)
                 Padding(
                   padding: const EdgeInsets.only(top: 4),

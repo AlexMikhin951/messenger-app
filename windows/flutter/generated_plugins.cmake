@@ -5,8 +5,11 @@
 list(APPEND FLUTTER_PLUGIN_LIST
   app_links
   audioplayers_windows
+  connectivity_plus
   flutter_webrtc
+  livekit_client
   local_notifier
+  permission_handler_windows
   screen_retriever_windows
   url_launcher_windows
   window_manager

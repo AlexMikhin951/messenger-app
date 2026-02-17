@@ -1,8 +1,8 @@
 import 'dart:io';
-import 'package:flutter/foundation.dart'; // Для kIsWeb
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
-import '../services/signaling_manager.dart'; // ! Добавляем импорт
+import '../services/signaling_manager.dart';
 import 'contacts_screen.dart';
 
 class AuthScreen extends StatefulWidget {
@@ -21,7 +21,16 @@ class _AuthScreenState extends State<AuthScreen> {
   Future<void> _handleAuth() async {
     setState(() => _isLoading = true);
     final api = ApiService();
-    final phone = _phoneController.text.trim().replaceAll(RegExp(r'[^\d]'), '');
+
+    // 1. ОЧИСТКА И НОРМАЛИЗАЦИЯ НОМЕРА
+    // Оставляем только цифры: +7 (999) -> 7999
+    String phone =
+        _phoneController.text.trim().replaceAll(RegExp(r'[^\d]'), '');
+
+    // Исправляем 8 на 7 для РФ, чтобы не было дублей в базе
+    if (phone.length == 11 && phone.startsWith('8')) {
+      phone = '7' + phone.substring(1);
+    }
 
     if (phone.isEmpty) {
       _showError("Введите номер телефона");
@@ -29,27 +38,28 @@ class _AuthScreenState extends State<AuthScreen> {
       return;
     }
 
-    // Пароль, генерируемый по номеру
+    // Генерируем пароль на основе чистого номера
     final String hiddenPassword = "family_member_$phone";
 
+    debugPrint("📡 Попытка входа: Пользователь=$phone");
+
     try {
-      // 1. Попытка входа
+      // 2. ПОПЫТКА ВХОДА
+      // Запрос пойдет через ApiService().pb, который теперь настроен на прямой IP
       await api.pb.collection('users').authWithPassword(phone, hiddenPassword);
 
-      // ! ВАЖНО: Запускаем сервисы звонков после входа
-      _initSignaling();
-
-      // Сохраняем данные
-      await api.saveCredentials(phone, hiddenPassword);
-
-      _goToContacts();
+      // Если вход успешен
+      _onAuthSuccess(phone, hiddenPassword);
     } catch (e) {
-      // 2. Если пользователя нет -> Регистрация
+      // 3. ЕСЛИ ВХОД НЕ УДАЛСЯ (Пользователь не найден или пароль не совпал)
+      debugPrint("ℹ️ Вход не удался, пробуем регистрацию. Ошибка: $e");
+
       if (!_showNameField) {
         setState(() {
           _showNameField = true;
           _isLoading = false;
         });
+        _showError("Пользователь не найден. Введите имя для регистрации.");
         return;
       }
 
@@ -60,7 +70,8 @@ class _AuthScreenState extends State<AuthScreen> {
       }
 
       try {
-        // 3. Регистрация
+        // 4. РЕГИСТРАЦИЯ
+        debugPrint("📝 Создание нового профиля: $phone");
         await api.pb.collection('users').create(body: {
           "username": phone,
           "name": _nameController.text.trim(),
@@ -68,44 +79,49 @@ class _AuthScreenState extends State<AuthScreen> {
           "passwordConfirm": hiddenPassword,
         });
 
-        // Вход сразу после регистрации
+        // Сразу входим после создания
         await api.pb
             .collection('users')
             .authWithPassword(phone, hiddenPassword);
-
-        // ! ВАЖНО: Запускаем сервисы звонков после регистрации
-        _initSignaling();
-
-        // Сохраняем учетные данные
-        await api.saveCredentials(phone, hiddenPassword);
-
-        _goToContacts();
+        _onAuthSuccess(phone, hiddenPassword);
       } catch (err) {
-        _showError("Ошибка регистрации: $err");
+        // Если ошибка 400 тут — значит юзер в базе есть, но пароль другой
+        debugPrint("❌ Ошибка регистрации/входа: $err");
+        _showError(
+            "Этот номер уже занят, но пароль не подошел. Очистите базу данных.");
       }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
   }
 
-  // Вынес инициализацию в отдельный метод
+  // Метод, который запускается при успешном входе
+  void _onAuthSuccess(String phone, String password) async {
+    final api = ApiService();
+
+    // Инициализируем звонки и уведомления
+    _initSignaling();
+
+    // Сохраняем данные для автоматического входа при следующем запуске
+    await api.saveCredentials(phone, password);
+
+    _goToContacts();
+  }
+
   void _initSignaling() {
     try {
-      // 1. Запускаем пульс "Я онлайн"
       SignalingManager().startHeartbeat();
 
-      // 2. ВАЖНО: Включаем прослушку входящих звонков
-      // (так как main.dart делает это только при авто-входе)
       if (mounted) {
         SignalingManager().initCallListener(context);
       }
 
-      // 3. Слушаем уведомления (только Desktop)
+      // Уведомления только для десктопа
       if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
         SignalingManager().startListeningNotifications();
       }
     } catch (e) {
-      debugPrint("Ошибка инициализации сигналинга: $e");
+      debugPrint("⚠️ Ошибка инициализации звонков: $e");
     }
   }
 
@@ -126,14 +142,13 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Весь остальной UI код без изменений, он хороший
     return Scaffold(
       body: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [Colors.blue.shade800, Colors.blue.shade400],
+            colors: [Colors.blue.shade900, Colors.blue.shade500],
           ),
         ),
         child: Center(
@@ -142,32 +157,37 @@ class _AuthScreenState extends State<AuthScreen> {
               margin: const EdgeInsets.all(24),
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(24)),
-              elevation: 8,
+              elevation: 10,
               child: Padding(
                 padding: const EdgeInsets.all(32),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(Icons.family_restroom,
-                        size: 64, color: Colors.blue.shade700),
+                        size: 80, color: Colors.blue.shade800),
                     const SizedBox(height: 16),
                     const Text("Семейный Чат",
                         style: TextStyle(
-                            fontSize: 22, fontWeight: FontWeight.bold)),
+                            fontSize: 24, fontWeight: FontWeight.bold)),
                     const SizedBox(height: 8),
-                    Text(_showNameField ? "Регистрация" : "Добро пожаловать",
+                    Text(_showNameField ? "Создание аккаунта" : "Авторизация",
                         style: TextStyle(color: Colors.grey.shade600)),
                     const SizedBox(height: 32),
+
+                    // Поле ввода номера
                     TextField(
                       controller: _phoneController,
                       keyboardType: TextInputType.phone,
                       decoration: InputDecoration(
                         prefixIcon: const Icon(Icons.phone),
                         labelText: "Номер телефона",
+                        hintText: "79001234567",
                         border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12)),
                       ),
                     ),
+
+                    // Поле ввода имени (появляется если юзера нет)
                     if (_showNameField) ...[
                       const SizedBox(height: 16),
                       TextField(
@@ -175,22 +195,24 @@ class _AuthScreenState extends State<AuthScreen> {
                         autofocus: true,
                         decoration: InputDecoration(
                           prefixIcon: const Icon(Icons.person),
-                          labelText: "Ваше имя",
+                          labelText: "Ваше имя (как вас видит семья)",
                           border: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(12)),
                         ),
                       ),
                     ],
-                    const SizedBox(height: 24),
+
+                    const SizedBox(height: 32),
+
                     SizedBox(
                       width: double.infinity,
-                      height: 50,
+                      height: 55,
                       child: ElevatedButton(
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blue.shade700,
+                          backgroundColor: Colors.blue.shade800,
                           foregroundColor: Colors.white,
                           shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12)),
+                              borderRadius: BorderRadius.circular(15)),
                         ),
                         onPressed: _isLoading ? null : _handleAuth,
                         child: _isLoading

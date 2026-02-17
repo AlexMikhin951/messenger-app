@@ -21,6 +21,11 @@ dependencies:
   audioplayers: ^6.5.1
   window_manager: ^0.5.1
   crypto: ^3.0.3
+  # ... твои текущие пакеты ...
+  livekit_client: ^2.2.0
+  dart_jsonwebtoken: ^2.14.0
+  permission_handler: ^11.3.0
+  flutter_v2ray: ^1.0.10
 
 dev_dependencies:
   flutter_test:

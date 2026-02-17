@@ -103,13 +103,11 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _startCall() async {
-    // Определяем ориентацию (важно для мобилок, на десктопе обычно landscape)
+    // 1. Определяем ориентацию
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    await _signaling.openUserMedia(
-        _localRenderer, _remoteRenderer, isLandscape);
-
+    // 2. Устанавливаем слушатель состояния соединения
     _signaling.onPeerConnectionState = (state) {
       debugPrint("PeerConnectionState: $state");
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateClosed ||
@@ -121,15 +119,31 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     if (widget.isIncoming && _activeRoomId != null) {
       try {
-        await _signaling.joinCall(_activeRoomId!, _remoteRenderer, context);
+        // ИСПРАВЛЕНО: Передаем 5 аргументов для joinCall
+        // Порядок: roomId, localRenderer, remoteRenderer, context, isLandscape
+        await _signaling.joinCall(
+            _activeRoomId!,
+            _localRenderer, // Добавлено
+            _remoteRenderer,
+            context,
+            isLandscape // Добавлено
+            );
       } catch (e) {
         debugPrint("Error joining call: $e");
         _exit();
       }
     } else {
       try {
+        // ИСПРАВЛЕНО: Передаем 5 аргументов для createCall
+        // Порядок: receiverId, localRenderer, remoteRenderer, context, isLandscape
         _activeRoomId = await _signaling.createCall(
-            widget.receiverId, _remoteRenderer, context);
+            widget.receiverId,
+            _localRenderer, // Добавлено
+            _remoteRenderer,
+            context,
+            isLandscape // Добавлено
+            );
+
         if (_activeRoomId != null) {
           _listenToCallTermination();
         } else {

@@ -6,7 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/group_chat_service.dart';
 import '../services/api_service.dart';
-import 'package:http/http.dart' as http;
+import 'group_call_screen.dart'; // <--- Убедись, что импорт правильный
 
 class GroupChatScreen extends StatefulWidget {
   final String groupId;
@@ -29,12 +29,14 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   final Map<String, bool> _downloadingFiles = {};
   bool _isLoading = true;
   late String _myId;
+  late String _myName;
 
   @override
   void initState() {
     super.initState();
-    // Безопасное получение ID
-    _myId = _service.api.pb.authStore.record?.id ?? '';
+    final user = _service.api.pb.authStore.record;
+    _myId = user?.id ?? '';
+    _myName = user?.getStringValue('name') ?? 'Участник';
     _initChat();
   }
 
@@ -65,7 +67,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           _messages.addAll(data);
           _isLoading = false;
         });
-        // Помечаем сообщения как прочитанные
         for (var m in data) {
           _checkAndMarkRead(m);
         }
@@ -82,6 +83,39 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       _service.markAsRead(m.id);
     }
   }
+
+  // --- ЛОГИКА ЗВОНКА ---
+  Future<void> _onJoinVideoCall() async {
+    // 1. Создаем запись в БД о звонке, чтобы другие видели "Групповой звонок"
+    try {
+      // ПРИМЕЧАНИЕ: Я использую поле 'group', так как это групповой чат.
+      // Если у тебя поле называется по-другому (например, conversation), замени его здесь.
+      await _service.api.pb.collection('messages').create(body: {
+        "content": "📞 Начал групповой звонок",
+        "sender": _myId,
+        "group": widget.groupId, // ID текущей группы
+        "type": "call_success", // Тип сообщения (для иконки звонка)
+        "is_read": true,
+      });
+    } catch (e) {
+      debugPrint("Ошибка при создании записи о звонке: $e");
+      // Не блокируем переход, если ошибка только в создании сообщения
+    }
+
+    // 2. Переходим на экран видеосвязи
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => GroupCallScreen(
+          roomName: widget.groupId, // ID Группы = ID Комнаты
+          identity: _myId, // Мой ID (теперь параметр существует!)
+          userName: _myName, // Мое имя
+        ),
+      ),
+    );
+  }
+  // ---------------------
 
   Future<void> _onSendText() async {
     if (_msgController.text.trim().isEmpty) return;
@@ -101,15 +135,11 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   Future<void> _onPickFile() async {
     try {
-      // ! ВАЖНО: withData: true нужно для веба
       FilePickerResult? result =
           await FilePicker.platform.pickFiles(withData: true);
 
       if (result != null) {
         final file = result.files.single;
-
-        // ! Исправленная логика отправки для кроссплатформенности
-        // Передаем и путь (для Desktop), и байты (для Web)
         await _service.sendFile(widget.groupId,
             path: kIsWeb ? null : file.path,
             bytes: file.bytes,
@@ -153,7 +183,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Весь UI код остался прежним, он корректен
     return Scaffold(
       backgroundColor: const Color(0xFFF5F7FB),
       appBar: AppBar(
@@ -169,6 +198,15 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         ),
         backgroundColor: Colors.blueAccent,
         iconTheme: const IconThemeData(color: Colors.white),
+        // КНОПКА ВИДЕОЗВОНКА
+        actions: [
+          IconButton(
+            onPressed: _onJoinVideoCall,
+            icon: const Icon(Icons.videocam_rounded, size: 28),
+            tooltip: "Войти в видеочат",
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
       body: Column(
         children: [
@@ -189,14 +227,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
-  // ... (Остальные методы _renderMessage, _buildSystemMessage, _buildBubble, _buildInputArea)
-  // Скопируйте их из вашего кода, они не требуют изменений.
-
   Widget _renderMessage(RecordModel m) {
     final String type = m.getStringValue('type', 'text');
     final bool isMe = m.getStringValue('sender') == _myId;
     final String content = m.getStringValue('content');
 
+    // Если это сообщение о звонке - показываем красивую плашку
     if (type == 'call_missed' || type == 'call_success') {
       return _buildSystemMessage(type, content);
     }
@@ -205,14 +241,37 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   Widget _buildSystemMessage(String type, String content) {
-    return Center(
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-        decoration: BoxDecoration(
-            color: Colors.black12, borderRadius: BorderRadius.circular(12)),
-        child: Text(content,
-            style: const TextStyle(fontSize: 11, color: Colors.black54)),
+    final isSuccess = type == 'call_success';
+    return GestureDetector(
+      // При нажатии на сообщение о звонке тоже можно присоединиться
+      onTap: _onJoinVideoCall,
+      child: Center(
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(
+              color: isSuccess
+                  ? Colors.green.withOpacity(0.1)
+                  : Colors.red.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                  color: isSuccess
+                      ? Colors.green.withOpacity(0.3)
+                      : Colors.red.withOpacity(0.3))),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.videocam,
+                  size: 16, color: isSuccess ? Colors.green : Colors.red),
+              const SizedBox(width: 8),
+              Text(content,
+                  style: TextStyle(
+                      fontSize: 12,
+                      color: isSuccess ? Colors.green[800] : Colors.red[800],
+                      fontWeight: FontWeight.bold)),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -220,7 +279,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   Widget _buildBubble(RecordModel m, bool isMe, String type, String content) {
     final bool isDownloading = _downloadingFiles[m.id] ?? false;
 
-    // Пытаемся достать имя из expand
     final senderData = m.expand['sender']?[0];
     final senderName = senderData?.getStringValue('name') ?? "Участник";
 
