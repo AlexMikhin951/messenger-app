@@ -1,13 +1,16 @@
 import 'dart:io'; // Для Platform
 import 'package:flutter/foundation.dart'; // Для kIsWeb
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // ДОБАВЛЕНО для буфера обмена
+import 'package:flutter/services.dart'; // Для буфера обмена и звуков/вибрации
 import 'package:pocketbase/pocketbase.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:http/http.dart' as http;
+import 'package:audioplayers/audioplayers.dart';
 import '../services/api_service.dart';
 import 'video_call_screen.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:open_filex/open_filex.dart';
 
 class ChatScreen extends StatefulWidget {
   final RecordModel receiver;
@@ -26,10 +29,19 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final Map<String, bool> _downloadingFiles = {};
 
+  // Аудиоплееры для звуков
+  final AudioPlayer _keyboardSoundPlayer = AudioPlayer();
+  final AudioPlayer _messageSoundPlayer = AudioPlayer();
+
+  // Флаг для отслеживания первого нажатия (чтобы не играть звук при длительном удержании)
+  bool _isFirstKeyPress = true;
+
   @override
   void initState() {
     super.initState();
     _myId = api.pb.authStore.record?.id ?? "";
+    // Устанавливаем громкость 70% для звука сообщений
+    _messageSoundPlayer.setVolume(0.7);
     if (_myId.isNotEmpty) {
       _initChat();
     } else {
@@ -44,8 +56,32 @@ class _ChatScreenState extends State<ChatScreen> {
     _subscribeToMessages();
   }
 
+  // Метод для воспроизведения тихого звука клавиатуры (как в Telegram)
+  Future<void> _playKeyboardSound() async {
+    try {
+      // Используем очень тихий системный звук или пользовательский файл
+      await _keyboardSoundPlayer.setVolume(0.1); // Очень тихо
+      await _keyboardSoundPlayer.play(AssetSource('keyboardtap.mp3'));
+    } catch (e) {
+      try {
+        await SystemSound.play(SystemSoundType.click);
+      } catch (_) {}
+    }
+  }
+
+  // Метод для воспроизведения звука сообщения (70% громкости)
+  Future<void> _playMessageSound() async {
+    try {
+      await _messageSoundPlayer.setVolume(0.7);
+      await _messageSoundPlayer.play(AssetSource('mes.mp3'));
+    } catch (e) {
+      debugPrint("Ошибка воспроизведения звука сообщения: $e");
+    }
+  }
+
   // Метод для копирования текста в буфер обмена
   void _copyToClipboard(String text) {
+    HapticFeedback.lightImpact(); // Мягкая вибрация при копировании
     Clipboard.setData(ClipboardData(text: text));
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -67,7 +103,8 @@ class _ChatScreenState extends State<ChatScreen> {
             (type == 'text' ||
                 type == 'file' ||
                 type == 'call_missed' ||
-                type == 'call_success');
+                type == 'call_success' ||
+                type == 'call_started'); // Добавили call_started
       }).toList();
 
       if (unread.isEmpty) return;
@@ -117,6 +154,13 @@ class _ChatScreenState extends State<ChatScreen> {
             setState(() {
               if (e.action == 'create') {
                 _messages.insert(0, m);
+
+                // Воспроизводим звук и вибрацию при получении чужого сообщения
+                if (senderId != _myId) {
+                  HapticFeedback.lightImpact();
+                  _playMessageSound();
+                }
+
                 if (receiverId == _myId && (type == 'text' || type == 'file')) {
                   _markAsRead();
                 }
@@ -126,7 +170,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   _messages[index] = m;
                 }
                 if (receiverId == _myId &&
-                    (type == 'call_missed' || type == 'call_success')) {
+                    (type == 'call_missed' ||
+                        type == 'call_success' ||
+                        type == 'call_started')) {
                   _markAsRead();
                 }
               }
@@ -139,6 +185,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _sendMessage() async {
     if (_msgController.text.trim().isEmpty) return;
+
+    HapticFeedback.mediumImpact();
+    _playMessageSound();
+
     final text = _msgController.text.trim();
     _msgController.clear();
     try {
@@ -174,6 +224,10 @@ class _ChatScreenState extends State<ChatScreen> {
               'attachment', fileObj.path!,
               filename: fileObj.name);
         }
+
+        HapticFeedback.mediumImpact();
+        _playMessageSound();
+
         await api.pb.collection('messages').create(
           body: {
             "sender": _myId,
@@ -195,23 +249,49 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _handleFileTap(RecordModel m) async {
     final String attachmentName = m.getStringValue('attachment');
     if (attachmentName.isEmpty) return;
+
+    if (kIsWeb) {
+      final fileUrl = api.pb.files.getUrl(m, attachmentName).toString();
+      await launchUrl(Uri.parse(fileUrl));
+      return;
+    }
+
     setState(() => _downloadingFiles[m.id] = true);
+
     try {
       final fileUrl = api.pb.files.getUrl(m, attachmentName).toString();
-      final uri = Uri.parse(fileUrl);
+      final dir = await getApplicationDocumentsDirectory();
+      final filePath = "${dir.path}/$attachmentName";
+      final file = File(filePath);
 
-      // На мобильных устройствах externalApplication иногда дает сбой,
-      // поэтому добавляем альтернативный режим запуска.
-      if (await canLaunchUrl(uri)) {
-        await launchUrl(uri,
-            mode: kIsWeb
-                ? LaunchMode.platformDefault
-                : LaunchMode.externalApplication);
-      } else {
-        throw 'Could not launch $fileUrl';
+      if (await file.exists()) {
+        await OpenFilex.open(filePath);
+        return;
       }
+
+      final client = api.pb.httpClientFactory();
+      final response = await client.get(Uri.parse(fileUrl));
+
+      if (response.statusCode == 200) {
+        await file.writeAsBytes(response.bodyBytes);
+        final result = await OpenFilex.open(filePath);
+        if (result.type != ResultType.done) {
+          throw "Не удалось открыть файл: ${result.message}";
+        }
+      } else {
+        throw "Ошибка загрузки: ${response.statusCode}";
+      }
+
+      client.close();
     } catch (e) {
       debugPrint("Ошибка при работе с файлом: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text("Ошибка открытия файла: $e"),
+              backgroundColor: Colors.red),
+        );
+      }
     } finally {
       if (mounted) setState(() => _downloadingFiles.remove(m.id));
     }
@@ -220,13 +300,16 @@ class _ChatScreenState extends State<ChatScreen> {
   void _startVideoCall() async {
     if (_myId.isEmpty) return;
     String? createdMessageId;
+
+    HapticFeedback.heavyImpact(); // Сильная вибрация при звонке
+
     try {
       final callMsg = await api.pb.collection('messages').create(body: {
         "sender": _myId,
         "receiver": widget.receiver.id,
-        "content": "📞 Исходящий видеозвонок...",
-        "type": "call_success",
-        "is_read": true,
+        "content": "звонок", // Отправляем просто слово-маркер
+        "type": "call_started", // Новый статус
+        "is_read": false,
       });
       createdMessageId = callMsg.id;
     } catch (e) {
@@ -244,6 +327,11 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       ),
     );
+  }
+
+  void _onTextChanged(String text) {
+    HapticFeedback.selectionClick();
+    _playKeyboardSound();
   }
 
   @override
@@ -297,7 +385,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _renderMessage(RecordModel m) {
     final String type = m.getStringValue('type', 'text');
-    if (type == 'call_missed' || type == 'call_success') {
+    // Обрабатываем все 3 типа звонков
+    if (type == 'call_missed' ||
+        type == 'call_success' ||
+        type == 'call_started') {
       return _buildSystemMessage(m);
     }
     return _buildMessageBubble(m);
@@ -305,37 +396,54 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildSystemMessage(RecordModel m) {
     final String type = m.getStringValue('type');
-    final String content = m.getStringValue('content');
-    final bool isMissed = type == 'call_missed';
+    final bool isMe = m.getStringValue('sender') == _myId;
+
+    String text;
+    IconData icon;
+    Color color;
+    Color bgColor;
+    Color borderColor;
+
+    if (type == 'call_started') {
+      text = isMe ? "📞 Исходящий звонок..." : "📞 Входящий звонок...";
+      icon = isMe ? Icons.call_made : Icons.call_received;
+      color = Colors.blue.shade700;
+      bgColor = Colors.blue.withOpacity(0.1);
+      borderColor = Colors.blue.withOpacity(0.2);
+    } else if (type == 'call_missed') {
+      text = isMe ? "Отмененный звонок" : "Пропущенный звонок";
+      icon = isMe ? Icons.call_made : Icons.call_missed;
+      color = Colors.red.shade700;
+      bgColor = Colors.red.withOpacity(0.1);
+      borderColor = Colors.red.withOpacity(0.2);
+    } else {
+      // call_success
+      text = isMe ? "Исходящий видеозвонок" : "Входящий видеозвонок";
+      icon = isMe ? Icons.call_made : Icons.call_received;
+      color = Colors.green.shade700;
+      bgColor = Colors.green.withOpacity(0.1);
+      borderColor = Colors.green.withOpacity(0.2);
+    }
 
     return Center(
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 12),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         decoration: BoxDecoration(
-          color: isMissed
-              ? Colors.red.withOpacity(0.1)
-              : Colors.green.withOpacity(0.1),
+          color: bgColor,
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-              color: isMissed
-                  ? Colors.red.withOpacity(0.2)
-                  : Colors.green.withOpacity(0.2)),
+          border: Border.all(color: borderColor),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              isMissed ? Icons.call_missed : Icons.call_made,
-              size: 16,
-              color: isMissed ? Colors.red : Colors.green,
-            ),
+            Icon(icon, size: 16, color: color),
             const SizedBox(width: 8),
             Text(
-              content,
+              text,
               style: TextStyle(
                 fontSize: 13,
-                color: isMissed ? Colors.red.shade700 : Colors.green.shade700,
+                color: color,
                 fontWeight: FontWeight.w600,
               ),
             ),
@@ -355,11 +463,8 @@ class _ChatScreenState extends State<ChatScreen> {
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
-        // Обычное нажатие для открытия файла
         onTap: type == 'file' ? () => _handleFileTap(m) : null,
-        // Долгое нажатие для копирования (Mobile)
         onLongPress: () => _copyToClipboard(content),
-        // Нажатие правой кнопкой мыши (Desktop)
         onSecondaryTap: () => _copyToClipboard(content),
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 4),
@@ -456,6 +561,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     borderRadius: BorderRadius.circular(24)),
                 child: TextField(
                   controller: _msgController,
+                  onChanged: _onTextChanged,
                   decoration: const InputDecoration(
                       hintText: "Сообщение...", border: InputBorder.none),
                   onSubmitted: (_) => _sendMessage(),
@@ -482,6 +588,8 @@ class _ChatScreenState extends State<ChatScreen> {
       api.pb.collection('messages').unsubscribe('*');
     } catch (_) {}
     _msgController.dispose();
+    _keyboardSoundPlayer.dispose();
+    _messageSoundPlayer.dispose();
     super.dispose();
   }
 }

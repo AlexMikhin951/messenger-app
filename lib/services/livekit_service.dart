@@ -1,76 +1,99 @@
 import 'package:livekit_client/livekit_client.dart';
 import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
+import 'api_service.dart'; // Сервис, где хранится IP сервера
 
 class LiveKitService {
-  // ⚠️ ЗАМЕНИ НА IP ТВОЕГО СЕРВЕРА ЯНДЕКС
-  // Например: 'ws://84.21.15.12:7880'
-  final String _host = 'ws://ТВОЙ_IP_СЕРВЕРА:7880';
+  // ИСПОЛЬЗУЕМ ВАШИ НАСТОЯЩИЕ КЛЮЧИ С СЕРВЕРА
+  static const String _apiKey = "CK_FamilyChat_User";
+  static const String _apiSecret = "CS_9v2qXwL5mP1zQ8r5wL2jK6hF0dG3s";
 
-  // Твои секретные ключи (из конфига сервера)
-  final String _apiKey = 'CK_FamilyChat_User';
-  final String _apiSecret = 'CS_9v2qXwL5mP1zQ8r5wL2jK6hF0dG3s';
+  /// Генерирует токен для входа (Локально)
+  String _generateToken(String roomName, String participantName) {
+    // Токен живет 2 часа
+    final now = DateTime.now();
+    final exp = now.add(const Duration(hours: 2));
 
-  Room? room;
-
-  // Генерация токена (Теперь принимает поле name)
-  String _generateToken(String roomName, String identity, String name) {
     final jwt = JWT(
       {
-        'sub': identity, // Уникальный ID пользователя
-        'iss': _apiKey,
-        'name': name, // <--- ДОБАВЛЕНО: Имя, которое увидят другие участники
-        'video': {
-          'room': roomName,
-          'roomJoin': true,
+        "sub": participantName, // Уникальный идентификатор (identity)
+        "name": participantName, // Имя пользователя для UI
+        "iss": _apiKey,
+        "nbf": now.millisecondsSinceEpoch ~/ 1000,
+        "exp": exp.millisecondsSinceEpoch ~/ 1000,
+        "video": {
+          "room": roomName,
+          "roomJoin": true,
+          "canPublish": true,
+          "canSubscribe": true,
+          // Разрешаем скрытые подписки (важно для оптимизации)
+          "hidden": false,
         },
       },
     );
+
     return jwt.sign(SecretKey(_apiSecret));
   }
 
-  // Метод подключения (Обновлено: принимает 3 аргумента)
-  Future<void> joinRoom(
-      String roomName, String identity, String userName) async {
+  /// Главный метод подключения
+  Future<Room?> joinGroupCall(String roomName, String participantName) async {
     try {
-      // 1. Создаем токен с именем пользователя
-      final token = _generateToken(roomName, identity, userName);
+      // 1. Достаем IP из ApiService
+      // ApiService к этому моменту УЖЕ должен быть инициализирован
+      final api = ApiService();
+      final currentIp = api.config?.ip;
 
-      // 2. Инициализируем комнату
-      room = Room();
+      if (currentIp == null || currentIp.isEmpty) {
+        throw Exception(
+            "Ошибка: IP сервера неизвестен. Нет связи с ApiService.");
+      }
 
-      // 3. НАСТРОЙКИ ЭКОНОМИИ (Спасаем твой сервер 1GB RAM)
-      final connectOptions = RoomOptions(
+      // 2. Формируем URL
+      // Используем ws:// (не wss), так как у нас голый IP без домена/SSL для порта 7880
+      final String wsUrl = "ws://$currentIp:7880";
+
+      print("🔗 [LiveKit] Подключение к групповому звонку: $wsUrl");
+
+      // 3. Генерируем токен
+      String token = _generateToken(roomName, participantName);
+
+      // 4. Настраиваем параметры комнаты для мобилок
+      final roomOptions = RoomOptions(
+        // Адаптивный стрим экономит трафик и батарею (отключает видео тех, кого не видно)
+        adaptiveStream: true,
+        dynacast: true,
+
+        // Настройки публикации видео (Simulcast важен для плохих сетей)
         defaultVideoPublishOptions: const VideoPublishOptions(
-          simulcast: false, // ВАЖНО: Выключаем нагрузку на сервер
-          videoEncoding: VideoEncoding(
-            maxBitrate: 250000, // 250 кбит/с (480p low quality)
-            maxFramerate: 15, // 15 FPS
-          ),
-          videoCodec: 'vp8',
+          simulcast: true,
+          videoCodec: 'VP8', // VP8 самый стабильный и легкий
         ),
+
+        // Настройки звука (DTX выключает передачу тишины)
         defaultAudioPublishOptions: const AudioPublishOptions(
-          audioBitrate: 20000, // Экономный звук
+          dtx: true,
         ),
       );
 
-      // 4. Подключаемся
-      await room!.connect(
-        _host,
+      // 5. Создаем объект комнаты и коннектимся
+      final room = Room();
+
+      await room.connect(
+        wsUrl,
         token,
-        roomOptions: connectOptions,
+        roomOptions: roomOptions,
+        // Сразу включаем камеру и микрофон при входе, чтобы сэкономить время
+        fastConnectOptions: FastConnectOptions(
+          microphone: const TrackOption(enabled: true),
+          camera: const TrackOption(enabled: true),
+        ),
       );
 
-      // 5. Включаем камеру и микрофон
-      await room!.localParticipant?.setCameraEnabled(true);
-      await room!.localParticipant?.setMicrophoneEnabled(true);
+      print("✅ [LiveKit] Успешный вход в комнату: ${room.name}");
+      return room;
     } catch (e) {
-      print('LiveKit Error: $e');
+      print("❌ [LiveKit] Ошибка подключения: $e");
+      // Пробрасываем ошибку дальше, чтобы UI мог показать SnackBar
       rethrow;
     }
-  }
-
-  Future<void> leave() async {
-    await room?.disconnect();
-    room = null;
   }
 }

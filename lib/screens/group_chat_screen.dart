@@ -1,12 +1,13 @@
 import 'dart:io'; // Для Platform
 import 'package:flutter/foundation.dart'; // Для kIsWeb
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // <-- НОВОЕ: Для работы с буфером обмена
 import 'package:pocketbase/pocketbase.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/group_chat_service.dart';
 import '../services/api_service.dart';
-import 'group_call_screen.dart'; // <--- Убедись, что импорт правильный
+import 'group_call_screen.dart';
 
 class GroupChatScreen extends StatefulWidget {
   final String groupId;
@@ -37,20 +38,27 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final user = _service.api.pb.authStore.record;
     _myId = user?.id ?? '';
     _myName = user?.getStringValue('name') ?? 'Участник';
+
+    if (_myName.isEmpty) {
+      _myName = user?.getStringValue('username') ?? 'Участник';
+    }
+
     _initChat();
   }
 
   Future<void> _initChat() async {
     await _loadHistory();
-    // Подписываемся на новые сообщения
-    _service.subscribe(widget.groupId, (record) {
+    // ИЗМЕНЕНИЕ: Обрабатываем как новые сообщения (create), так и обновления (update)
+    _service.subscribe(widget.groupId, (record, action) {
       if (mounted) {
         setState(() {
           final index = _messages.indexWhere((m) => m.id == record.id);
-          if (index == -1) {
+          if (index == -1 && action == 'create') {
+            // Новое сообщение
             _messages.insert(0, record);
             _checkAndMarkRead(record);
-          } else {
+          } else if (index != -1) {
+            // Обновление существующего (например, статус звонка изменился)
             _messages[index] = record;
           }
         });
@@ -84,33 +92,52 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
-  // --- ЛОГИКА ЗВОНКА ---
-  Future<void> _onJoinVideoCall() async {
-    // 1. Создаем запись в БД о звонке, чтобы другие видели "Групповой звонок"
-    try {
-      // ПРИМЕЧАНИЕ: Я использую поле 'group', так как это групповой чат.
-      // Если у тебя поле называется по-другому (например, conversation), замени его здесь.
-      await _service.api.pb.collection('messages').create(body: {
-        "content": "📞 Начал групповой звонок",
-        "sender": _myId,
-        "group": widget.groupId, // ID текущей группы
-        "type": "call_success", // Тип сообщения (для иконки звонка)
-        "is_read": true,
-      });
-    } catch (e) {
-      debugPrint("Ошибка при создании записи о звонке: $e");
-      // Не блокируем переход, если ошибка только в создании сообщения
+  // --- УМНАЯ ЛОГИКА ЗВОНКА ---
+  Future<void> _startOrJoinCall({String? existingMessageId}) async {
+    String? messageIdToPass = existingMessageId;
+
+    if (messageIdToPass == null) {
+      try {
+        // 1. Проверяем, есть ли уже активный звонок в этой группе
+        final activeCalls = await _service.api.pb
+            .collection('group_messages')
+            .getList(
+              filter: 'group_id = "${widget.groupId}" && type = "call_active"',
+              perPage: 1,
+            );
+
+        if (activeCalls.items.isNotEmpty) {
+          // Если звонок уже идет, просто подключаемся к нему, НЕ СОЗДАВАЯ новое сообщение (защита от спама)
+          messageIdToPass = activeCalls.items.first.id;
+        } else {
+          // 2. Если звонка нет, создаем новое оповещение в чате
+          final callMessage =
+              await _service.api.pb.collection('group_messages').create(body: {
+            "content": "$_myName начал(а) голосовой чат",
+            "sender": _myId,
+            "group_id": widget.groupId,
+            "type": "call_active", // Статус: активен
+            "is_read": false,
+          });
+          messageIdToPass = callMessage.id;
+        }
+      } catch (e) {
+        debugPrint("Ошибка старта звонка: $e");
+        return; // Если БД упала, лучше не пускать в экран, чтобы не сломать логику
+      }
     }
 
-    // 2. Переходим на экран видеосвязи
+    // 3. Переход на экран звонка
     if (!mounted) return;
     Navigator.push(
       context,
       MaterialPageRoute(
         builder: (context) => GroupCallScreen(
-          roomName: widget.groupId, // ID Группы = ID Комнаты
-          identity: _myId, // Мой ID (теперь параметр существует!)
-          userName: _myName, // Мое имя
+          roomName: widget.groupId,
+          identity: _myId,
+          userName: _myName,
+          // Передаем ID сообщения, чтобы в GroupCallScreen можно было его "завершить"
+          messageId: messageIdToPass,
         ),
       ),
     );
@@ -174,6 +201,50 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
+  // --- НОВОЕ: Меню при долгом нажатии на сообщение ---
+  void _showMessageOptions(RecordModel m, String type, String content) {
+    showModalBottomSheet(
+        context: context,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        builder: (context) => SafeArea(
+              child: Wrap(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Text("Действия",
+                        style: TextStyle(
+                            color: Colors.grey.shade600,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                  if (type == 'text')
+                    ListTile(
+                      leading: const Icon(Icons.copy, color: Colors.blueAccent),
+                      title: const Text('Копировать текст'),
+                      onTap: () {
+                        Clipboard.setData(ClipboardData(text: content));
+                        Navigator.pop(context);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Текст скопирован')));
+                      },
+                    ),
+                  if (type == 'file')
+                    ListTile(
+                      leading:
+                          const Icon(Icons.download, color: Colors.blueAccent),
+                      title: const Text('Скачать / Открыть файл'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _handleFileTap(m);
+                      },
+                    ),
+                  const SizedBox(height: 10),
+                ],
+              ),
+            ));
+  }
+
   @override
   void dispose() {
     _service.unsubscribe();
@@ -201,9 +272,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         // КНОПКА ВИДЕОЗВОНКА
         actions: [
           IconButton(
-            onPressed: _onJoinVideoCall,
+            onPressed: () => _startOrJoinCall(), // Вызываем нашу умную функцию
             icon: const Icon(Icons.videocam_rounded, size: 28),
-            tooltip: "Войти в видеочат",
+            tooltip: "Голосовой чат",
           ),
           const SizedBox(width: 8),
         ],
@@ -232,46 +303,92 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final bool isMe = m.getStringValue('sender') == _myId;
     final String content = m.getStringValue('content');
 
-    // Если это сообщение о звонке - показываем красивую плашку
-    if (type == 'call_missed' || type == 'call_success') {
-      return _buildSystemMessage(type, content);
+    // Если это сообщение о звонке - показываем БОЛЬШУЮ ПЛАШКУ
+    if (type == 'call_active' || type == 'call_ended') {
+      return _buildCallCard(m, type, content);
     }
 
     return _buildBubble(m, isMe, type, content);
   }
 
-  Widget _buildSystemMessage(String type, String content) {
-    final isSuccess = type == 'call_success';
-    return GestureDetector(
-      // При нажатии на сообщение о звонке тоже можно присоединиться
-      onTap: _onJoinVideoCall,
-      child: Center(
-        child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 8),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          decoration: BoxDecoration(
-              color: isSuccess
-                  ? Colors.green.withOpacity(0.1)
-                  : Colors.red.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(
-                  color: isSuccess
-                      ? Colors.green.withOpacity(0.3)
-                      : Colors.red.withOpacity(0.3))),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
+  // --- НОВОЕ: Большая карточка звонка посреди чата ---
+  Widget _buildCallCard(RecordModel m, String type, String content) {
+    final isActive = type == 'call_active';
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+            color: isActive ? Colors.green.shade400 : Colors.grey.shade300,
+            width: isActive ? 2 : 1),
+        boxShadow: const [
+          BoxShadow(color: Colors.black12, blurRadius: 6, offset: Offset(0, 3))
+        ],
+      ),
+      child: Column(
+        children: [
+          Row(
             children: [
-              Icon(Icons.videocam,
-                  size: 16, color: isSuccess ? Colors.green : Colors.red),
-              const SizedBox(width: 8),
-              Text(content,
-                  style: TextStyle(
-                      fontSize: 12,
-                      color: isSuccess ? Colors.green[800] : Colors.red[800],
-                      fontWeight: FontWeight.bold)),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: isActive
+                      ? Colors.green.withOpacity(0.15)
+                      : Colors.grey.withOpacity(0.15),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(isActive ? Icons.videocam : Icons.videocam_off,
+                    color: isActive ? Colors.green : Colors.grey, size: 28),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(content,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.bold, fontSize: 15)),
+                    const SizedBox(height: 4),
+                    Text(
+                        isActive
+                            ? "Голосовой чат активен"
+                            : "Голосовой чат завершён",
+                        style: TextStyle(
+                            color: isActive
+                                ? Colors.green.shade700
+                                : Colors.grey.shade600,
+                            fontSize: 13)),
+                  ],
+                ),
+              )
             ],
           ),
-        ),
+          // Показываем кнопку "Присоединиться", только если звонок еще идет
+          if (isActive) ...[
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              height: 44,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: () => _startOrJoinCall(existingMessageId: m.id),
+                icon: const Icon(Icons.call),
+                label: const Text("Присоединиться",
+                    style:
+                        TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+              ),
+            )
+          ]
+        ],
       ),
     );
   }
@@ -300,7 +417,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                       fontWeight: FontWeight.bold,
                       color: Colors.blueGrey)),
             ),
+          // Оборачиваем в GestureDetector для долгого нажатия
           GestureDetector(
+            onLongPress: () => _showMessageOptions(m, type, content),
             onTap: type == 'file' ? () => _handleFileTap(m) : null,
             child: Container(
               margin: const EdgeInsets.symmetric(vertical: 2),

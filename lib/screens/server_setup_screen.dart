@@ -5,7 +5,7 @@ import '../services/signaling_manager.dart';
 import 'auth_screen.dart';
 import 'contacts_screen.dart';
 import 'dart:io';
-import 'package:flutter/foundation.dart'; // Для kIsWeb
+import 'package:flutter/foundation.dart';
 
 class ServerSetupScreen extends StatefulWidget {
   const ServerSetupScreen({super.key});
@@ -26,33 +26,11 @@ class _ServerSetupScreenState extends State<ServerSetupScreen> {
 
   Future<void> _initApp() async {
     setState(() {
-      _message = "Запуск защищенного туннеля..."; // <-- Обновили статус
+      _message = "Подключение к серверу...";
       _isRetry = false;
     });
 
-    // 1. Инициализация V2Ray (Reality)
-    // ВАЖНО: Запускаем только на мобильных (Android/iOS),
-    // так как flutter_v2ray работает через нативные VPN API.
-    if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
-      try {
-        // Небольшая задержка, чтобы интерфейс успел отрисоваться перед тем,
-        // как ОС покажет диалог "Разрешить VPN"
-        await Future.delayed(const Duration(milliseconds: 500));
-
-        await SignalingManager().initSecureTunnel();
-      } catch (e) {
-        debugPrint("Ошибка запуска туннеля: $e");
-        // Мы не прерываем выполнение, пробуем соединиться так (вдруг мы в локальной сети)
-      }
-    }
-
-    if (!mounted) return;
-
-    setState(() {
-      _message = "Подключение к облаку...";
-    });
-
-    // 2. Инициализация API (теперь трафик пойдет через туннель)
+    // 1. Инициализация API (Скачиваем JSON с IP)
     final api = ApiService();
     bool success = await api.autoInitialize();
 
@@ -61,34 +39,35 @@ class _ServerSetupScreenState extends State<ServerSetupScreen> {
     if (success) {
       setState(() => _message = "Проверка авторизации...");
 
-      // 3. Проверяем сохраненные данные входа
+      // 2. Проверяем сохраненные данные входа
       final prefs = await SharedPreferences.getInstance();
       final savedPhone = prefs.getString('saved_phone');
       final savedPass = prefs.getString('saved_password');
 
       if (savedPhone != null && savedPass != null) {
         try {
-          // Пробуем войти автоматически (запрос тоже пойдет через туннель)
+          // Пробуем войти автоматически
           await api.pb
               .collection('users')
               .authWithPassword(savedPhone, savedPass);
 
-          // Запускаем сервисы звонков
+          // Запускаем пульс (онлайн статус)
           SignalingManager().startHeartbeat();
 
-          // Уведомления (только для десктопа, на мобильных нужны Push Notifications)
+          // Слушаем уведомления (если Windows/Linux)
           if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
             SignalingManager().startListeningNotifications();
           }
 
           if (!mounted) return;
+
           // Успех -> Идем в контакты
           Navigator.pushReplacement(context,
               MaterialPageRoute(builder: (context) => const ContactsScreen()));
           return;
         } catch (e) {
           debugPrint("Авто-вход не удался: $e");
-          // Если пароль устарел или ошибка - идем на экран входа
+          // Если пароль сменился — просто перекинет на форму входа ниже
         }
       }
 
@@ -96,11 +75,10 @@ class _ServerSetupScreenState extends State<ServerSetupScreen> {
       Navigator.pushReplacement(
           context, MaterialPageRoute(builder: (context) => const AuthScreen()));
     } else {
-      // Ошибка подключения (скорее всего туннель не пробился или нет инета)
+      // Ошибка подключения (нет интернета или сервер лежит)
       if (mounted) {
         setState(() {
-          _message =
-              "Не удалось подключиться к серверу.\nПроверьте VPN или интернет.";
+          _message = "Не удалось найти сервер.\nПроверьте интернет.";
           _isRetry = true;
         });
       }

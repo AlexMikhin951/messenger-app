@@ -7,7 +7,7 @@ import 'dart:async';
 import 'package:local_notifier/local_notifier.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
-import 'package:flutter_v2ray/flutter_v2ray.dart';
+import 'package:livekit_client/livekit_client.dart';
 
 class SignalingManager {
   static final SignalingManager _instance = SignalingManager._internal();
@@ -15,33 +15,31 @@ class SignalingManager {
   SignalingManager._internal();
 
   final api = ApiService();
+  final ValueNotifier<bool> isMinimized = ValueNotifier(false);
 
-  // 1. Создаем переменную для хранения статуса
-  String _v2rayState = "DISCONNECTED";
-
-  // 2. Инициализируем V2Ray с колбэком, который обновляет нашу переменную
-  late final FlutterV2ray _v2ray = FlutterV2ray(
-    onStatusChanged: (V2RayStatus status) {
-      _v2rayState = status.state; // Сохраняем состояние (например, "CONNECTED")
-      print("--- [V2Ray] Статус изменился на: $_v2rayState ---");
-    },
-  );
   RTCPeerConnection? _peerConnection;
-  MediaStream? _localStream;
 
+  MediaStream? _localStream;
   MediaStream? get localStream => _localStream;
+
+  // НОВОЕ: Добавили переменную для хранения видео собеседника
+  MediaStream? remoteStream;
+
   Function(RTCPeerConnectionState)? onPeerConnectionState;
 
   List<RTCIceCandidate> _remoteCandidatesQueue = [];
   bool _isNavigating = false;
-
-  // Регулярка для замены локальных IP на IP сервера (если нужно)
-  final _internalIpRegex = RegExp(
-      r'\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b');
+  String? currentRoomId;
+  String? currentReceiverId;
+  bool isGroupCall = false;
+  Room? currentLiveKitRoom;
+  String? groupRoomName;
+  String? groupUserName;
+  String? groupIdentity;
+  String? groupMessageId;
 
   Map<String, dynamic> _getVideoConstraints(bool isLandscape) {
-    double width =
-        isLandscape ? 1280 : 720; // Оптимизировал разрешение для стабильности
+    double width = isLandscape ? 1280 : 720;
     double height = isLandscape ? 720 : 1280;
 
     return {
@@ -51,62 +49,35 @@ class SignalingManager {
     };
   }
 
-  // --- ИСПРАВЛЕНО: Берем IP из конфига ApiService ---
   Map<String, dynamic> _getIceConfig() {
-    // В режиме Варианта Б (Reality Stealth) мы заставляем WebRTC
-    // подключаться к локальному прокси-порту V2Ray.
-    // Обычно V2Ray на Android/iOS создает VPN-интерфейс,
-    // поэтому 127.0.0.1 — это "вход" в твой защищенный туннель.
+    // Этот IP уже был получен в ApiService (возможно, через обход блокировок)
+    final String ip = api.config?.ip ?? '';
 
-    const String localhost = '127.0.0.1';
-    print("--- [LOG] ICE Config: Маршрутизация через туннель (localhost) ---");
+    print("--- [LOG] ICE Config: Подключение к серверу $ip ---");
 
+    if (ip.isEmpty) {
+      print("--- [ERROR] IP сервера не найден! Звонок может не пройти. ---");
+      return {};
+    }
+
+    // Если "белые списки" жесткие, то Google STUN всё равно не поможет.
+    // Надеемся, что прямой доступ к IP сервера по UDP/TCP портам открыт.
     return {
       'iceServers': [
         {
-          // Форсируем TCP транспорт, так как Reality лучше всего работает с ним,
-          // и это позволяет полностью скрыть UDP-трафик звонка.
-          'urls': 'turn:$localhost:3478?transport=tcp',
-          'username': 'myuser',
-          'credential': 'mypassword',
+          'urls': [
+            'stun:$ip:3478',
+            'turn:$ip:3478'
+            // Совет: Если есть возможность, настрой на сервере TURN на порту 443
+            // 'turn:$ip:443?transport=tcp'
+          ],
+          'username': 'family',
+          'credential': 'strongpassword123',
         },
-        {'urls': 'stun:$localhost:3478?transport=tcp'},
       ],
       'sdpSemantics': 'unified-plan',
       'iceCandidatePoolSize': 10,
     };
-  }
-
-  String _optimizeSdp(String sdp) {
-    List<String> lines = sdp.split('\n');
-    List<String> filteredLines = [];
-
-    for (String line in lines) {
-      // 1. Убираем всё, что связано с UDP (нам нужен только TCP внутри туннеля)
-      if (line.contains('udp') || line.contains('UDP')) {
-        continue;
-      }
-
-      // 2. Если строка содержит IP-адрес, меняем его на локальный вход туннеля
-      if (line.contains('IN IP4')) {
-        // Заменяем любой IP на 127.0.0.1
-        line = line.replaceAllMapped(
-            RegExp(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'),
-            (match) => '127.0.0.1');
-      }
-
-      // 3. Добавляем настройки битрейта для видео (важно для стабильности в туннеле)
-      if (line.contains('a=fmtp:96')) {
-        // x-google-max-bitrate=1500 (1.5 мбит/с) — золотая середина для мобильного 4G через прокси
-        line =
-            '$line;x-google-max-bitrate=1500;x-google-min-bitrate=500;x-google-start-bitrate=800';
-      }
-
-      filteredLines.add(line);
-    }
-
-    // Собираем обратно
-    return filteredLines.join('\n');
   }
 
   final Map<String, dynamic> _constraints = {
@@ -145,79 +116,7 @@ class SignalingManager {
     }
   }
 
-  Future<void> initSecureTunnel() async {
-    print("--- [V2Ray] Инициализация защищенного туннеля... ---");
-
-    // Запрашиваем разрешение на VPN (Android/iOS спросит пользователя)
-    if (!await _v2ray.requestPermission()) {
-      print("--- [ERROR] Пользователь отклонил разрешение на VPN ---");
-      return;
-    }
-
-    // Твой конфиг VLESS Reality (Client Config)
-    // ВНИМАНИЕ: Замени данные на свои реальные из панели 3X-UI
-    final String config = """
-    {
-      "log": {
-        "loglevel": "warning"
-      },
-      "inbounds": [
-        {
-          "port": 10808,
-          "listen": "127.0.0.1",
-          "protocol": "socks",
-          "settings": {
-            "udp": true
-          }
-        }
-      ],
-      "outbounds": [
-        {
-          "protocol": "vless",
-          "settings": {
-            "vnext": [
-              {
-                "address": "ТВОЙ_IP_СЕРВЕРА", 
-                "port": 443,
-                "users": [
-                  {
-                    "id": "ТВОЙ_UUID",
-                    "encryption": "none",
-                    "flow": "xtls-rprx-vision"
-                  }
-                ]
-              }
-            ]
-          },
-          "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": {
-              "show": false,
-              "fingerprint": "chrome",
-              "serverName": "vk.com", 
-              "publicKey": "ТВОЙ_PUBLIC_KEY",
-              "shortId": "ТВОЙ_SHORT_ID",
-              "spiderX": "/"
-            }
-          },
-          "tag": "proxy"
-        }
-      ]
-    }
-    """;
-
-    try {
-      await _v2ray.startV2Ray(
-        remark: "Secure VK Tunnel",
-        config: config,
-        proxyOnly: false, // false = режим VPN (весь трафик перехватывается)
-      );
-      print("--- [V2Ray] Команда на запуск отправлена ---");
-    } catch (e) {
-      print("--- [ERROR] Ошибка запуска ядра V2Ray: $e ---");
-    }
-  }
+  // --- V2Ray Init УДАЛЕН ---
 
   void _setupIceExchange(
       String roomId, bool isCaller, BuildContext context) async {
@@ -226,21 +125,17 @@ class SignalingManager {
     final remoteField =
         isCaller ? 'ice_candidates_receiver' : 'ice_candidates_caller';
 
-    // Используем IP из конфига
-    final String serverIp = api.config?.ip ?? '127.0.0.1';
     final Set<String> addedCandidates = {};
 
     _peerConnection?.onIceCandidate = (RTCIceCandidate candidate) async {
       if (candidate.candidate == null) return;
 
-      String candidateStr = candidate.candidate!
-          .replaceAllMapped(_internalIpRegex, (match) => serverIp);
-
+      // Отправляем кандидат "как есть", без подмены IP
       try {
         final call = await api.pb.collection('calls').getOne(roomId);
         List candidates = List.from(call.data[myField] ?? []);
         candidates.add({
-          'candidate': candidateStr,
+          'candidate': candidate.candidate,
           'sdpMid': candidate.sdpMid,
           'sdpMLineIndex': candidate.sdpMLineIndex,
         });
@@ -298,18 +193,10 @@ class SignalingManager {
       RTCVideoRenderer remoteRenderer,
       BuildContext context,
       bool isLandscape) async {
-    print("--- [LOG] Create Call (Stealth Mode: V2Ray/Reality) ---");
+    print("--- [LOG] Create Call (Direct Mode) ---");
 
     try {
-      // 1. Проверка состояния туннеля через нашу внутреннюю переменную
-      // Вариант Б: звонок не начнется, пока "броня" не активна
-      if (_v2rayState != "CONNECTED") {
-        print(
-            "--- [WARNING] Внимание: V2Ray не подключен (Статус: $_v2rayState) ---");
-        // Здесь можно выбросить ошибку или вызвать метод подключения
-      }
-
-      // 2. Инициализация камеры и микрофона
+      // 1. Инициализация камеры
       await openUserMedia(localRenderer, remoteRenderer, isLandscape);
 
       if (_localStream == null) {
@@ -317,14 +204,12 @@ class SignalingManager {
         return null;
       }
 
-      // 3. Создание PeerConnection с ICE-конфигом на localhost
-      // Это заставляет WebRTC искать TURN-сервер внутри туннеля
+      // 2. Создание PeerConnection
       _peerConnection = await createPeerConnection(_getIceConfig());
       _setConnectionListeners(context, null);
 
       List<RTCIceCandidate> earlyCandidates = [];
 
-      // Собираем кандидатов локально
       _peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
         if (candidate.candidate != null) {
           earlyCandidates.add(candidate);
@@ -333,45 +218,37 @@ class SignalingManager {
 
       _peerConnection?.onTrack = (RTCTrackEvent event) {
         if (event.streams.isNotEmpty) {
-          scheduleMicrotask(() => remoteRenderer.srcObject = event.streams[0]);
+          // ИЗМЕНЕНИЕ: Сохраняем поток собеседника в глобальную переменную
+          remoteStream = event.streams[0];
+          scheduleMicrotask(() => remoteRenderer.srcObject = remoteStream);
         }
       };
 
-      // 4. Привязка локального видео-потока к соединению
       _localStream!.getTracks().forEach((track) {
         _peerConnection?.addTrack(track, _localStream!);
       });
 
-      // 5. Создание Offer и "стелс-оптимизация" SDP
+      // 3. Создание Offer (Без оптимизации SDP)
       RTCSessionDescription offer =
           await _peerConnection!.createOffer(_constraints);
 
-      // Вырезаем реальные IP, заменяя их на 127.0.0.1 и форсируя TCP
-      String optimizedSdp = _optimizeSdp(offer.sdp!);
+      await _peerConnection!.setLocalDescription(offer);
 
-      await _peerConnection!
-          .setLocalDescription(RTCSessionDescription(optimizedSdp, 'offer'));
-
-      // 6. Регистрация звонка в PocketBase
-      // Запрос идет через туннель, провайдер видит "запрос к VK"
+      // 4. Регистрация звонка
       final record = await api.pb.collection('calls').create(body: {
         'caller': api.pb.authStore.record!.id,
         'receiver': receiverId,
-        'offer': optimizedSdp, // Транслируем только безопасный SDP
+        'offer': offer.sdp,
         'status': 'calling',
         'ice_candidates_caller': [],
         'ice_candidates_receiver': [],
       });
 
-      // 7. Маскировка и отправка ICE-кандидатов
+      // 5. Отправка ранних кандидатов
       if (earlyCandidates.isNotEmpty) {
-        // Подменяем все IP на адрес локального входа в туннель
-        const String stealthIp = '127.0.0.1';
-
         List candidatesJson = earlyCandidates
             .map((c) => {
-                  'candidate': c.candidate!
-                      .replaceAllMapped(_internalIpRegex, (match) => stealthIp),
+                  'candidate': c.candidate,
                   'sdpMid': c.sdpMid,
                   'sdpMLineIndex': c.sdpMLineIndex,
                 })
@@ -382,10 +259,8 @@ class SignalingManager {
             .update(record.id, body: {'ice_candidates_caller': candidatesJson});
       }
 
-      // 8. Запуск слушателя для обмена кандидатами
       _setupIceExchange(record.id, true, context);
 
-      // 9. Подписка на Answer (ответ от получателя)
       bool answerSet = false;
       api.pb.collection('calls').subscribe(record.id, (e) async {
         if (e.action == 'update' &&
@@ -395,15 +270,12 @@ class SignalingManager {
               RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
             answerSet = true;
             try {
-              print(
-                  "--- [LOG] Ответ получен. Устанавливаем защищенную сессию... ---");
+              print("--- [LOG] Ответ получен. Соединяем... ---");
               await _peerConnection?.setRemoteDescription(
                   RTCSessionDescription(e.record?.data['answer'], 'answer'));
-
-              // Применяем накопленные удаленные кандидаты
               await _processQueuedCandidates();
             } catch (err) {
-              print("--- [ERROR] Ошибка дешифровки/установки Answer: $err ---");
+              print("--- [ERROR] Ошибка установки Answer: $err ---");
               answerSet = false;
             }
           }
@@ -412,7 +284,7 @@ class SignalingManager {
 
       return record.id;
     } catch (e) {
-      print("--- [ERROR] Критическая ошибка createCall (Stealth): $e ---");
+      print("--- [ERROR] Критическая ошибка createCall: $e ---");
       return null;
     }
   }
@@ -445,7 +317,6 @@ class SignalingManager {
     print("--- [LOG] Join Call (Receiver) ---");
 
     try {
-      // 1. Сначала открываем медиа (ОБЯЗАТЕЛЬНО)
       await openUserMedia(localRenderer, remoteRenderer, isLandscape);
 
       if (_localStream == null) {
@@ -455,57 +326,47 @@ class SignalingManager {
 
       _remoteCandidatesQueue.clear();
 
-      // 2. Создаем PeerConnection
       _peerConnection = await createPeerConnection(_getIceConfig());
       _setConnectionListeners(context, roomId);
 
       _peerConnection?.onTrack = (RTCTrackEvent event) {
         if (event.streams.isNotEmpty) {
-          scheduleMicrotask(() => remoteRenderer.srcObject = event.streams[0]);
+          // ИЗМЕНЕНИЕ: Сохраняем поток собеседника в глобальную переменную
+          remoteStream = event.streams[0];
+          scheduleMicrotask(() => remoteRenderer.srcObject = remoteStream);
         }
       };
 
-      // 3. Добавляем свои треки
       _localStream!.getTracks().forEach((track) {
         _peerConnection?.addTrack(track, _localStream!);
       });
 
-      // 4. Запускаем обмен кандидатами
       _setupIceExchange(roomId, false, context);
 
-      // 5. Получаем данные о звонке (Offer)
       final callData = await api.pb.collection('calls').getOne(roomId);
 
-      // 6. Устанавливаем RemoteDescription (Offer от звонящего)
-      // Это критически важно сделать ПЕРЕД созданием Answer
       if (_peerConnection?.signalingState !=
           RTCSignalingState.RTCSignalingStateStable) {
-        print("--- [LOG] Устанавливаем Offer от звонящего... ---");
+        print("--- [LOG] Устанавливаем Offer... ---");
         await _peerConnection!.setRemoteDescription(
             RTCSessionDescription(callData.data['offer'], 'offer'));
 
-        // Теперь, когда Offer установлен, можно безопасно добавить кандидатов
         await _processQueuedCandidates();
 
-        // 7. Создаем свой Answer
         RTCSessionDescription answer =
             await _peerConnection!.createAnswer(_constraints);
-        String optimizedSdp = _optimizeSdp(answer.sdp!);
-        await _peerConnection!
-            .setLocalDescription(RTCSessionDescription(optimizedSdp, 'answer'));
 
-        // 8. Отправляем Answer в базу
+        await _peerConnection!.setLocalDescription(answer);
+
         await api.pb.collection('calls').update(roomId,
-            body: {'answer': optimizedSdp, 'status': 'connected'});
-        print("--- [LOG] Answer отправлен, соединение установлено ---");
+            body: {'answer': answer.sdp, 'status': 'connected'});
+        print("--- [LOG] Answer отправлен ---");
       }
     } catch (e) {
       print("--- [ERROR] Ошибка в joinCall: $e ---");
     }
   }
 
-  /// Переключение на захват экрана и обратно
-  /// ИСПРАВЛЕННАЯ ВЕРСИЯ ДЛЯ WEB и WINDOWS
   Future<void> switchScreenShare(RTCVideoRenderer localRenderer, bool enable,
       {BuildContext? context}) async {
     try {
@@ -514,14 +375,11 @@ class SignalingManager {
         print("--- [LOG] Запрос на захват экрана ---");
 
         if (kIsWeb) {
-          // --- ЛОГИКА ДЛЯ WEB ---
-          // В вебе браузер сам показывает диалог выбора окна/вкладки
           newStream = await navigator.mediaDevices.getDisplayMedia({
             'video': true,
             'audio': false,
           });
         } else if (WebRTC.platformIsWindows || WebRTC.platformIsMacOS) {
-          // --- ЛОГИКА ДЛЯ WINDOWS/MAC ---
           if (context != null) {
             final sources = await desktopCapturer
                 .getSources(types: [SourceType.Window, SourceType.Screen]);
@@ -559,7 +417,6 @@ class SignalingManager {
             });
           }
         } else {
-          // Для Android/iOS
           if (WebRTC.platformIsAndroid) await Helper.requestCapturePermission();
           newStream = await navigator.mediaDevices.getDisplayMedia({
             'video': {'width': 1280, 'height': 720, 'frameRate': 20},
@@ -568,7 +425,6 @@ class SignalingManager {
         }
       } else {
         print("--- [LOG] Возврат к камере ---");
-        // При возврате проверяем ориентацию
         final isLandscape = context != null &&
             MediaQuery.of(context).orientation == Orientation.landscape;
 
@@ -589,7 +445,6 @@ class SignalingManager {
     }
   }
 
-  /// Замена видео-трека "на лету" без разрыва соединения
   Future<void> _replaceVideoTrack(MediaStreamTrack newTrack) async {
     if (_peerConnection == null ||
         _peerConnection!.signalingState ==
@@ -601,7 +456,6 @@ class SignalingManager {
         if (transceiver.sender.track?.kind == 'video') {
           await transceiver.sender.replaceTrack(newTrack);
           trackReplaced = true;
-          print("--- [LOG] Трек заменен через Transceiver ---");
           break;
         }
       }
@@ -610,7 +464,6 @@ class SignalingManager {
         for (var sender in senders) {
           if (sender.track?.kind == 'video') {
             await sender.replaceTrack(newTrack);
-            print("--- [LOG] Трек заменен через Sender ---");
             break;
           }
         }
@@ -620,7 +473,6 @@ class SignalingManager {
     }
   }
 
-  /// Глобальный слушатель входящих вызовов
   void initCallListener(BuildContext context) {
     if (api.pb.authStore.record == null) return;
     final String myId = api.pb.authStore.record!.id;
@@ -677,7 +529,6 @@ class SignalingManager {
         Timer.periodic(const Duration(seconds: 5), (timer) => sendPulse());
   }
 
-  /// Получение доступа к медиа-устройствам с учетом ориентации
   Future<void> openUserMedia(
       RTCVideoRenderer local, RTCVideoRenderer remote, bool isLandscape) async {
     try {
@@ -692,9 +543,51 @@ class SignalingManager {
   }
 
   Future<void> hangUp(String? roomId) async {
+    isMinimized.value = false;
+
+    // 1. ГРУППОВОЙ ЗВОНОК
+    if (isGroupCall) {
+      if (currentLiveKitRoom != null) {
+        final int remaining = currentLiveKitRoom!.remoteParticipants.length;
+
+        // Гарантированно глушим железо
+        await currentLiveKitRoom!.localParticipant?.setCameraEnabled(false);
+        await currentLiveKitRoom!.localParticipant?.setMicrophoneEnabled(false);
+        await Future.delayed(const Duration(milliseconds: 100)); // Ждем железо
+
+        await currentLiveKitRoom!.disconnect();
+        currentLiveKitRoom = null;
+
+        // Завершаем звонок для группы, только если вышли последними
+        if (remaining == 0 && groupMessageId != null) {
+          try {
+            await api.pb
+                .collection('group_messages')
+                .update(groupMessageId!, body: {"type": "call_ended"});
+          } catch (_) {}
+        }
+      }
+
+      isGroupCall = false;
+      groupRoomName = null;
+      groupUserName = null;
+      groupIdentity = null;
+      groupMessageId = null;
+
+      return;
+    }
+
+    // 2. ЛИЧНЫЙ ЗВОНОК
+    currentRoomId = null;
+    currentReceiverId = null;
     onPeerConnectionState = null;
+
     _localStream?.getTracks().forEach((track) => track.stop());
     _localStream = null;
+
+    remoteStream?.getTracks().forEach((track) => track.stop());
+    remoteStream = null;
+
     await _peerConnection?.close();
     _peerConnection = null;
 
@@ -707,28 +600,28 @@ class SignalingManager {
   }
 
   void startListeningNotifications() async {
-    // В вебе работа с SSE может блокироваться CORS, но код оставляем валидным
-    final user = ApiService().pb.authStore.model;
-    if (user == null) return;
+    if (api.pb.authStore.model == null) return;
 
+    final user = api.pb.authStore.model;
     final String phone =
         user.getStringValue("username").replaceAll(RegExp(r'\D'), '');
     final String topic = "family_msg_$phone";
 
     try {
-      final request =
-          http.Request("GET", Uri.parse("https://ntfy.sh/$topic/sse"));
-      final client = http.Client();
-      final response = await client.send(request);
+      final uri = Uri.parse("https://ntfy.sh/$topic/sse");
+      final request = http.Request("GET", uri);
 
-      print("--- [LOG] Подключено к ntfy: $topic ---");
+      final client = api.pb.httpClientFactory();
+
+      print("--- [LOG] Подключение к ntfy ($topic)... ---");
+
+      final response = await client.send(request);
 
       response.stream
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
         final trimmedLine = line.trim();
-
         if (!trimmedLine.startsWith('data:')) return;
 
         try {
@@ -740,21 +633,17 @@ class SignalingManager {
 
           if (data['event'] == 'keepalive') return;
 
-          print("--- [LOG] Валидное уведомление: ${data['event']} ---");
-
-          // Вызов уведомления
           if (data['title'] != null && data['message'] != null) {
             _showWindowsNotification(data['title'], data['message']);
           }
-        } catch (e) {
-          print("--- [ERROR] Ошибка парсинга: $e | Строка: $trimmedLine ---");
-        }
+        } catch (e) {}
       }, onError: (e) {
-        print("--- [ERROR] Ошибка стрима SSE: $e ---");
+        print("--- [ERROR] Разрыв SSE: $e. Реконнект... ---");
         _reconnect(() => startListeningNotifications());
       });
     } catch (e) {
-      print("--- [ERROR] Не удалось подключиться к ntfy: $e ---");
+      print("--- [ERROR] Ошибка ntfy: $e. Реконнект... ---");
+      _reconnect(() => startListeningNotifications());
     }
   }
 
@@ -762,7 +651,6 @@ class SignalingManager {
     Future.delayed(const Duration(seconds: 5), callback);
   }
 
-  // ОБНОВЛЕННЫЙ МЕТОД УВЕДОМЛЕНИЙ
   void _showWindowsNotification(String title, String body) {
     if (kIsWeb) return;
     try {

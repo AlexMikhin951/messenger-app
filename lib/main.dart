@@ -4,16 +4,18 @@ import 'package:flutter/material.dart';
 import 'package:local_notifier/local_notifier.dart';
 
 // Импорты экранов и сервисов
-import 'screens/server_setup_screen.dart'; // <-- Стартовый экран
+import 'screens/server_setup_screen.dart';
 import 'screens/auth_screen.dart';
 import 'screens/contacts_screen.dart';
 import 'screens/video_call_screen.dart';
+
+// Импорт виджета плавающего окна (внутри приложения)
+import 'widgets/global_call_overlay.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // Настройка уведомлений только для Desktop (Windows/Linux)
-  // В Web это не работает и не нужно (там ServiceWorker)
   if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
     try {
       await localNotifier.setup(
@@ -25,15 +27,13 @@ void main() async {
     }
   }
 
-  // Запускаем приложение сразу.
-  // Вся сетевая логика теперь внутри ServerSetupScreen.
   runApp(const FamilyMessengerApp());
 }
 
 class FamilyMessengerApp extends StatelessWidget {
   const FamilyMessengerApp({super.key});
 
-  // Глобальный ключ навигации (полезен для уведомлений и диалогов без контекста)
+  // Глобальный ключ навигации
   static final GlobalKey<NavigatorState> navigatorKey =
       GlobalKey<NavigatorState>();
 
@@ -49,12 +49,16 @@ class FamilyMessengerApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(
             seedColor: Colors.blue, brightness: Brightness.light),
         useMaterial3: true,
-        // Адаптивная плотность для разных платформ
         visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
 
-      // ! ВАЖНО: Стартуем с экрана настройки сервера
-      // Он найдет IP, проверит сертификат и перекинет на Auth или Contacts
+      // Оборачиваем все приложение в плавающее окно звонка (для UI внутри приложения)
+      builder: (context, child) {
+        return GlobalCallOverlay(
+          child: child!,
+        );
+      },
+
       home: const ServerSetupScreen(),
 
       // Основные маршруты

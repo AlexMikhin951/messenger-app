@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/material.dart';
-// Используем foundation для проверки платформы без крашей в Web
 import 'package:flutter/foundation.dart'
     show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:pocketbase/pocketbase.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:floating/floating.dart'; // <-- Пакет PiP
+
 import '../services/signaling_manager.dart';
 import '../services/api_service.dart';
 
@@ -29,14 +31,20 @@ class VideoCallScreen extends StatefulWidget {
 }
 
 class _VideoCallScreenState extends State<VideoCallScreen> {
-  // Используем Singleton SignalingManager, чтобы не плодить подключения
   final SignalingManager _signaling = SignalingManager();
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   final AudioPlayer _audioPlayer = AudioPlayer();
 
+  // Инициализация плагина Floating
+  final Floating _floating = Floating();
+
   Timer? _hideTimer;
+  Timer? _dialTimeoutTimer;
   UnsubscribeFunc? _unsubCall;
+
+  bool _isHangingUp = false;
+  bool _isCallSuccessful = false;
 
   String _callerName = "Загрузка...";
   String? _activeRoomId;
@@ -52,18 +60,26 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
   List<MediaDeviceInfo> _devices = [];
 
-  // --- ИСПРАВЛЕНИЕ: Добавлен Linux и macOS для унификации интерфейса ---
   bool get _isDesktopOrWeb =>
       kIsWeb ||
       defaultTargetPlatform == TargetPlatform.windows ||
-      defaultTargetPlatform == TargetPlatform.linux || // <-- Добавлено
-      defaultTargetPlatform == TargetPlatform.macOS; // <-- Добавлено
+      defaultTargetPlatform == TargetPlatform.linux ||
+      defaultTargetPlatform == TargetPlatform.macOS;
 
   @override
   void initState() {
     super.initState();
     _hasAccepted = !widget.isIncoming;
     _activeRoomId = widget.roomId;
+
+    _signaling.isMinimized.value = false;
+    WakelockPlus.enable();
+
+    // Задаем команду: автоматически переходить в PiP при сворачивании приложения
+    if (!_isDesktopOrWeb) {
+      _floating.enable(OnLeavePiP(aspectRatio: Rational(9, 16)));
+    }
+
     _initialize();
   }
 
@@ -77,21 +93,26 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     await _loadCallerInfo();
 
-    // Загружаем список устройств, если это Десктоп или Веб
     if (_isDesktopOrWeb) {
       await _loadDevices();
     } else {
-      // Логика только для Android/iOS
       Helper.setSpeakerphoneOn(_isSpeakerOn);
     }
 
     if (widget.isIncoming) {
       _playRingtone();
-      // Небольшая задержка перед подпиской, чтобы UI успел отрисоваться
       await Future.delayed(const Duration(milliseconds: 500));
       if (_activeRoomId != null) _listenToCallTermination();
     } else {
-      await _startCall();
+      _playDialTone();
+
+      if (_signaling.localStream == null) {
+        await _startCall();
+      } else {
+        _localRenderer.srcObject = _signaling.localStream;
+        _remoteRenderer.srcObject = _signaling.remoteStream;
+        if (mounted) setState(() {});
+      }
     }
 
     if (mounted) {
@@ -100,16 +121,42 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       });
     }
     _startHideTimer();
+
+    _dialTimeoutTimer = Timer(const Duration(seconds: 60), () {
+      if (mounted && !_isCallSuccessful) {
+        debugPrint("Таймаут дозвона (60 сек). Сбрасываем вызов.");
+        _exit();
+      }
+    });
+  }
+
+  Future<void> _markCallAsSuccess() async {
+    if (_isCallSuccessful || widget.messageId == null) return;
+    _isCallSuccessful = true;
+    _dialTimeoutTimer?.cancel();
+
+    try {
+      await ApiService().pb.collection('messages').update(
+        widget.messageId!,
+        body: {"type": "call_success"},
+      );
+    } catch (e) {
+      debugPrint("Ошибка обновления на call_success: $e");
+    }
   }
 
   Future<void> _startCall() async {
-    // 1. Определяем ориентацию
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    // 2. Устанавливаем слушатель состояния соединения
     _signaling.onPeerConnectionState = (state) {
       debugPrint("PeerConnectionState: $state");
+
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _audioPlayer.stop();
+        _markCallAsSuccess();
+      }
+
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateClosed ||
           state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
           state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
@@ -119,30 +166,16 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     if (widget.isIncoming && _activeRoomId != null) {
       try {
-        // ИСПРАВЛЕНО: Передаем 5 аргументов для joinCall
-        // Порядок: roomId, localRenderer, remoteRenderer, context, isLandscape
-        await _signaling.joinCall(
-            _activeRoomId!,
-            _localRenderer, // Добавлено
-            _remoteRenderer,
-            context,
-            isLandscape // Добавлено
-            );
+        await _signaling.joinCall(_activeRoomId!, _localRenderer,
+            _remoteRenderer, context, isLandscape);
       } catch (e) {
         debugPrint("Error joining call: $e");
         _exit();
       }
     } else {
       try {
-        // ИСПРАВЛЕНО: Передаем 5 аргументов для createCall
-        // Порядок: receiverId, localRenderer, remoteRenderer, context, isLandscape
-        _activeRoomId = await _signaling.createCall(
-            widget.receiverId,
-            _localRenderer, // Добавлено
-            _remoteRenderer,
-            context,
-            isLandscape // Добавлено
-            );
+        _activeRoomId = await _signaling.createCall(widget.receiverId,
+            _localRenderer, _remoteRenderer, context, isLandscape);
 
         if (_activeRoomId != null) {
           _listenToCallTermination();
@@ -157,9 +190,24 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     if (mounted) setState(() {});
   }
 
-  void _exit() {
+  Future<void> _exit() async {
+    _isHangingUp = true;
+    _signaling.isMinimized.value = false;
+    _dialTimeoutTimer?.cancel();
+
     if (!mounted) return;
     _audioPlayer.stop();
+
+    if (widget.messageId != null && !_isCallSuccessful) {
+      try {
+        await ApiService().pb.collection('messages').update(
+          widget.messageId!,
+          body: {"type": "call_missed"},
+        );
+      } catch (e) {
+        debugPrint("Ошибка обновления статуса звонка на missed: $e");
+      }
+    }
 
     _signaling
         .hangUp(_activeRoomId)
@@ -183,47 +231,108 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           body: Center(child: CircularProgressIndicator()));
     }
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          // Удаленное видео (во весь экран)
-          Positioned.fill(
-            child: _isRemoteVideoReady
-                ? RTCVideoView(_remoteRenderer,
-                    objectFit:
-                        RTCVideoViewObjectFit.RTCVideoViewObjectFitContain)
-                : _buildPlaceholder(),
-          ),
+    // В вебе PiPSwitcher не работает, отдаем сразу интерфейс
+    if (_isDesktopOrWeb) {
+      return _buildFullScreenUI();
+    }
 
-          // Тап для скрытия/показа контролов
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onTap: () {
-                setState(() => _showControls = !_showControls);
-                if (_showControls) _startHideTimer();
-              },
-              child: Container(color: Colors.transparent),
-            ),
-          ),
+    // Для мобильных используем переключатель экранов PiP
+    return PiPSwitcher(
+      childWhenEnabled: Scaffold(
+        backgroundColor: Colors.black,
+        body: _isRemoteVideoReady
+            ? RTCVideoView(_remoteRenderer,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)
+            : const Center(
+                child: Icon(Icons.person, color: Colors.white, size: 50)),
+      ),
+      childWhenDisabled: _buildFullScreenUI(),
+    );
+  }
 
-          // Интерфейс активного звонка
-          if (_hasAccepted) ...[
-            if (_isCameraOn) _buildLocalPreview(),
-            _buildTopBar(),
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 300),
-              bottom: _showControls ? 40 : -120,
-              left: 0,
-              right: 0,
-              child: Center(child: _buildModernControlPanel()),
+  // Весь твой UI перенесен сюда без изменений (кроме верхней левой кнопки)
+  Widget _buildFullScreenUI() {
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop && !_isHangingUp) {
+          _signaling.isGroupCall = false;
+          _signaling.currentRoomId = _activeRoomId;
+          _signaling.currentReceiverId = widget.receiverId;
+          _signaling.isMinimized.value = true;
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
+          children: [
+            Positioned.fill(
+              child: _isRemoteVideoReady
+                  ? RTCVideoView(_remoteRenderer,
+                      objectFit:
+                          RTCVideoViewObjectFit.RTCVideoViewObjectFitContain)
+                  : _buildPlaceholder(),
             ),
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onTap: () {
+                  setState(() => _showControls = !_showControls);
+                  if (_showControls) _startHideTimer();
+                },
+                child: Container(color: Colors.transparent),
+              ),
+            ),
+            if (_hasAccepted) ...[
+              if (_isCameraOn) _buildLocalPreview(),
+              _buildTopBar(),
+              AnimatedOpacity(
+                opacity: _showControls ? 1.0 : 0.0,
+                duration: const Duration(milliseconds: 300),
+                child: SafeArea(
+                  child: Align(
+                    alignment: Alignment.topLeft,
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 10, left: 10),
+                      child: Container(
+                        decoration: const BoxDecoration(
+                          color: Colors.black54,
+                          shape: BoxShape.circle,
+                        ),
+                        child: IconButton(
+                          // Иконка сворачивания в окно
+                          icon: const Icon(Icons.picture_in_picture_alt,
+                              color: Colors.white, size: 28),
+                          onPressed: () {
+                            if (!_isDesktopOrWeb) {
+                              // Принудительно вызываем PiP по кнопке
+                              _floating.enable(
+                                  ImmediatePiP(aspectRatio: Rational(9, 16)));
+                            } else {
+                              _signaling.isGroupCall = false;
+                              _signaling.currentRoomId = _activeRoomId;
+                              _signaling.currentReceiverId = widget.receiverId;
+                              _signaling.isMinimized.value = true;
+                              Navigator.pop(context);
+                            }
+                          },
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              AnimatedPositioned(
+                duration: const Duration(milliseconds: 300),
+                bottom: _showControls ? 40 : -120,
+                left: 0,
+                right: 0,
+                child: Center(child: _buildModernControlPanel()),
+              ),
+            ],
+            if (widget.isIncoming && !_hasAccepted) _buildIncomingCallUI(),
           ],
-
-          // Интерфейс входящего звонка (ответ/отбой)
-          if (widget.isIncoming && !_hasAccepted) _buildIncomingCallUI(),
-        ],
+        ),
       ),
     );
   }
@@ -239,7 +348,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Микрофон
               _buildRoundBtn(
                 icon: _isMicOn ? Icons.mic : Icons.mic_off,
                 active: _isMicOn,
@@ -251,8 +359,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                 },
               ),
               const SizedBox(width: 12),
-
-              // Камера
               _buildRoundBtn(
                 icon: _isCameraOn ? Icons.videocam : Icons.videocam_off,
                 active: _isCameraOn,
@@ -264,10 +370,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                 },
               ),
               const SizedBox(width: 12),
-
-              // --- ДЕСКТОПНЫЕ КНОПКИ (WEB / WIN / LINUX / MAC) ---
               if (_isDesktopOrWeb) ...[
-                // Демонстрация экрана
                 _buildRoundBtn(
                   icon: Icons.monitor,
                   active: _isScreenSharing,
@@ -277,8 +380,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                       : Colors.blueAccent,
                 ),
                 const SizedBox(width: 12),
-
-                // Настройки (Выбор устройств)
                 _buildRoundBtn(
                   icon: Icons.settings,
                   active: true,
@@ -286,8 +387,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   color: Colors.grey.shade700,
                 ),
               ] else ...[
-                // --- МОБИЛЬНЫЕ КНОПКИ ---
-                // Громкая связь
                 _buildRoundBtn(
                   icon: _isSpeakerOn ? Icons.volume_up : Icons.volume_down,
                   active: _isSpeakerOn,
@@ -297,7 +396,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   },
                 ),
                 const SizedBox(width: 12),
-                // Смена камеры
                 _buildRoundBtn(
                   icon: Icons.flip_camera_ios,
                   active: true,
@@ -310,10 +408,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   },
                 ),
               ],
-
               const SizedBox(width: 12),
-
-              // Завершить звонок
               _buildRoundBtn(
                 icon: Icons.call_end,
                 active: false,
@@ -357,8 +452,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    // --- УНИФИКАЦИЯ: Теперь Web, Windows и Linux используют одинаковые размеры ---
-    // Это обеспечивает единый вид интерфейса на всех "больших" системах
     double width = _isDesktopOrWeb ? 240.0 : (isLandscape ? 180.0 : 120.0);
     double height = _isDesktopOrWeb ? 135.0 : (isLandscape ? 120.0 : 180.0);
 
@@ -366,7 +459,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       top: 60,
       right: 20,
       child: GestureDetector(
-        // Можно добавить перетаскивание окна (Draggable), если захотите в будущем
         child: ClipRRect(
           borderRadius: BorderRadius.circular(16),
           child: Container(
@@ -375,7 +467,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
             decoration: BoxDecoration(
                 color: Colors.black, border: Border.all(color: Colors.white24)),
             child: RTCVideoView(_localRenderer,
-                mirror: !_isScreenSharing, // Зеркалим только если это камера
+                mirror: !_isScreenSharing,
                 objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
           ),
         ),
@@ -420,6 +512,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                     Icons.videocam, "Принять", Colors.greenAccent, () async {
                   _audioPlayer.stop();
                   setState(() => _hasAccepted = true);
+                  _markCallAsSuccess();
                   await _startCall();
                 }),
               ],
@@ -526,6 +619,31 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     }
   }
 
+  Future<void> _playDialTone() async {
+    try {
+      if (!kIsWeb) {
+        await _audioPlayer.setAudioContext(AudioContext(
+          android: AudioContextAndroid(
+            contentType: AndroidContentType.speech,
+            usageType: AndroidUsageType.voiceCommunication,
+            audioFocus: AndroidAudioFocus.gainTransientMayDuck,
+          ),
+          iOS: AudioContextIOS(
+            category: AVAudioSessionCategory.playAndRecord,
+            options: {
+              AVAudioSessionOptions.allowBluetooth,
+              AVAudioSessionOptions.defaultToSpeaker
+            },
+          ),
+        ));
+      }
+      await _audioPlayer.setReleaseMode(ReleaseMode.loop);
+      await _audioPlayer.play(AssetSource('sounds/DialTone.mp3'));
+    } catch (e) {
+      debugPrint("Ошибка гудков: $e");
+    }
+  }
+
   Future<void> _playRingtone() async {
     if (kIsWeb) {
       try {
@@ -538,8 +656,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     }
 
     try {
-      // На Linux этот код иногда требует установленного libmpv или vlc
-      // Но audioplayers обычно имеет фоллбек
       await _audioPlayer.setAudioContext(AudioContext(
         android: AudioContextAndroid(
           contentType: AndroidContentType.sonification,
@@ -553,8 +669,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
       await _audioPlayer.setReleaseMode(ReleaseMode.loop);
       await _audioPlayer.play(AssetSource('sounds/Ring.mp3'));
-
-      debugPrint("Рингтон запущен успешно");
     } catch (e) {
       debugPrint("Ошибка плеера: $e");
     }
@@ -562,7 +676,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
   Future<void> _loadDevices() async {
     try {
-      // Получаем все устройства (камеры, микрофоны, динамики)
       _devices = await navigator.mediaDevices.enumerateDevices();
       if (mounted) setState(() {});
     } catch (e) {
@@ -595,7 +708,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   _devices.where((d) => d.kind == 'audioinput').toList(),
                   (id) => _switchDevice('audio', id)),
               const Divider(color: Colors.white10, height: 30),
-              // --- НОВЫЙ БЛОК: ВЫБОР ДИНАМИКОВ ---
               _buildDeviceCategory(
                   "Вывод звука (Динамики)",
                   Icons.speaker,
@@ -653,7 +765,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
             .firstOrNull
             ?.applyConstraints({"deviceId": id});
       } else if (type == 'output') {
-        // Ключевой момент: устанавливаем ID устройства вывода для удаленного потока
         await _remoteRenderer.audioOutput(id);
       }
       if (mounted) setState(() {});
@@ -672,7 +783,18 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   @override
   void dispose() {
     _hideTimer?.cancel();
+    _dialTimeoutTimer?.cancel();
+
+    // ОТМЕНЯЕМ АВТОВКЛЮЧЕНИЕ PIP ПЕРЕД ВЫХОДОМ
+    if (!_isDesktopOrWeb) {
+      _floating.cancelOnLeavePiP();
+      // Метод _floating.dispose() здесь больше не нужен в новой версии пакета!
+    }
+
     if (_unsubCall != null) _unsubCall!();
+
+    WakelockPlus.disable();
+
     _audioPlayer.dispose();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
