@@ -4,6 +4,15 @@
 
 Данный проект демонстрирует навыки проектирования клиент-серверной архитектуры, работы с асинхронными потоками данных и организации P2P-соединений.
 
+<div align="center">
+  <img width="1501" height="846" alt="image" src="https://github.com/user-attachments/assets/7e45ffe8-ef82-42aa-9c39-23ee5cfd2af8" />
+  <img width="1243" height="812" alt="image" src="https://github.com/user-attachments/assets/46ac38c4-903f-4b93-9c72-f8b30ed99fc1" />
+  <img width="857" height="540" alt="image" src="https://github.com/user-attachments/assets/f5f85822-97e7-4698-8096-a3a558ede697" />
+   <img width="426" height="720" alt="image" src="https://github.com/user-attachments/assets/1eb499f6-ecbe-49e5-9653-60c9f5f785a2" />
+</div>
+
+
+
 ## 🚀 Основные возможности
 
 * **Обмен сообщениями в реальном времени:** Мгновенная доставка и обновление статуса текстовых сообщений благодаря реактивным подпискам (WebSockets/SSE).
