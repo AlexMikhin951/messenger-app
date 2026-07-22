@@ -1,5 +1,6 @@
 name: Flutter Universal AppImage Build
-on: [push, workflow_dispatch]
+# Сборка Linux AppImage — только вручную. Не связана с веб-демо на GitHub Pages.
+on: workflow_dispatch
 
 jobs:
   build:
