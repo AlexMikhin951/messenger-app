@@ -1,0 +1,9 @@
+{
+  "name": "Family Messenger Demo",
+  "short_name": "Messenger Demo",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#FFFFFF",
+  "theme_color": "#2196F3",
+  "description": "Interactive portfolio demo"
+}

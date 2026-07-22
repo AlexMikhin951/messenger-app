@@ -4,6 +4,16 @@
 
 Данный проект демонстрирует навыки проектирования клиент-серверной архитектуры, работы с асинхронными потоками данных и организации P2P-соединений.
 
+## 🌐 Интерактивное веб-демо
+
+**[Открыть демо →](https://AlexMikhin951.github.io/messenger-app/)**
+
+Кликабельная Flutter Web версия без сервера: вход, чаты, отправка сообщений, экран видеозвонка. Данные локальные, API-ключи не нужны.
+
+После merge в `main` включите **Settings → Pages → Branch: `gh-pages`**.
+
+Код демо: папка [`demo/`](demo/).
+
 <div align="center">
   <img width="1501" height="846" alt="image" src="https://github.com/user-attachments/assets/7e45ffe8-ef82-42aa-9c39-23ee5cfd2af8" />
   <img width="1243" height="812" alt="image" src="https://github.com/user-attachments/assets/46ac38c4-903f-4b93-9c72-f8b30ed99fc1" />
