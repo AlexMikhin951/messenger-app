@@ -55,6 +55,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        backgroundColor: Colors.blue.shade700,
+        foregroundColor: Colors.white,
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -149,8 +151,8 @@ class _MessageBubble extends StatelessWidget {
   Widget build(BuildContext context) {
     final isCall = message.type != DemoMessageType.text;
     final color = message.isMine
-        ? Theme.of(context).colorScheme.primaryContainer
-        : Theme.of(context).colorScheme.surfaceContainerHighest;
+        ? Colors.blue.shade100
+        : Colors.grey.shade200;
 
     return Align(
       alignment: message.isMine ? Alignment.centerRight : Alignment.centerLeft,
