@@ -3,7 +3,9 @@ import 'package:pocketbase/pocketbase.dart';
 import 'api_service.dart';
 
 class GroupChatService {
-  final api = ApiService();
+  GroupChatService(this.api);
+
+  final ApiService api;
 
   // Загрузка сообщений
   Future<List<RecordModel>> getGroupMessages(String groupId) async {

@@ -32,11 +32,18 @@ dependencies:
   wakelock_plus: ^1.2.8
   open_filex: ^4.7.0
   floating: ^6.0.0
+  file_saver: ^0.2.0    # Для выбора папки при сохранении файлов
+  video_player: ^2.8.0  # Для воспроизведения видео прямо в чате
+  record: ^6.2.0
+  path: ^1.9.1
+  tray_manager: ^0.5.2
+  flutter_riverpod: ^3.3.2
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+
 
 flutter:
   uses-material-design: true
@@ -46,3 +53,4 @@ flutter:
     - assets/proxies.json
     - assets/sounds/bel.mp3
     - assets/sounds/DialTone.mp3
+    - assets/sounds/mes.mp3

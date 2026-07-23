@@ -1,147 +1,50 @@
 import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import '../services/api_service.dart';
-import '../services/signaling_manager.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '../providers/auth_provider.dart';
+import '../providers/signaling_session_provider.dart';
 import 'contacts_screen.dart';
 
-class AuthScreen extends StatefulWidget {
+class AuthScreen extends ConsumerStatefulWidget {
   const AuthScreen({super.key});
 
   @override
-  State<AuthScreen> createState() => _AuthScreenState();
+  ConsumerState<AuthScreen> createState() => _AuthScreenState();
 }
 
-class _AuthScreenState extends State<AuthScreen> {
+class _AuthScreenState extends ConsumerState<AuthScreen> {
   final _phoneController = TextEditingController();
   final _nameController = TextEditingController();
-  bool _isLoading = false;
-  bool _showNameField = false;
 
-  Future<void> _handleAuth() async {
-    setState(() => _isLoading = true);
-    final api = ApiService();
-
-    // 1. ОЧИСТКА И НОРМАЛИЗАЦИЯ НОМЕРА
-    // Оставляем только цифры: +7 (999) -> 7999
-    String phone =
-        _phoneController.text.trim().replaceAll(RegExp(r'[^\d]'), '');
-
-    // Исправляем 8 на 7 для РФ, чтобы не было дублей в базе
-    if (phone.length == 11 && phone.startsWith('8')) {
-      phone = '7' + phone.substring(1);
-    }
-
-    if (phone.isEmpty) {
-      _showError("Введите номер телефона");
-      setState(() => _isLoading = false);
-      return;
-    }
-
-    // Генерируем пароль на основе чистого номера
-    final String hiddenPassword = "family_member_$phone";
-
-    debugPrint("📡 Попытка входа: Пользователь=$phone");
-
-    try {
-      // 2. ПОПЫТКА ВХОДА
-      // Запрос пойдет через ApiService().pb, который теперь настроен на прямой IP
-      await api.pb.collection('users').authWithPassword(phone, hiddenPassword);
-
-      // Если вход успешен
-      _onAuthSuccess(phone, hiddenPassword);
-    } catch (e) {
-      // 3. ЕСЛИ ВХОД НЕ УДАЛСЯ (Пользователь не найден или пароль не совпал)
-      debugPrint("ℹ️ Вход не удался, пробуем регистрацию. Ошибка: $e");
-
-      if (!_showNameField) {
-        setState(() {
-          _showNameField = true;
-          _isLoading = false;
-        });
-        _showError("Пользователь не найден. Введите имя для регистрации.");
-        return;
-      }
-
-      if (_nameController.text.trim().isEmpty) {
-        _showError("Введите ваше имя");
-        setState(() => _isLoading = false);
-        return;
-      }
-
-      try {
-        // 4. РЕГИСТРАЦИЯ
-        debugPrint("📝 Создание нового профиля: $phone");
-        await api.pb.collection('users').create(body: {
-          "username": phone,
-          "name": _nameController.text.trim(),
-          "password": hiddenPassword,
-          "passwordConfirm": hiddenPassword,
-        });
-
-        // Сразу входим после создания
-        await api.pb
-            .collection('users')
-            .authWithPassword(phone, hiddenPassword);
-        _onAuthSuccess(phone, hiddenPassword);
-      } catch (err) {
-        // Если ошибка 400 тут — значит юзер в базе есть, но пароль другой
-        debugPrint("❌ Ошибка регистрации/входа: $err");
-        _showError(
-            "Этот номер уже занят, но пароль не подошел. Очистите базу данных.");
-      }
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
-  }
-
-  // Метод, который запускается при успешном входе
-  void _onAuthSuccess(String phone, String password) async {
-    final api = ApiService();
-
-    // Инициализируем звонки и уведомления
-    _initSignaling();
-
-    // Сохраняем данные для автоматического входа при следующем запуске
-    await api.saveCredentials(phone, password);
-
-    _goToContacts();
-  }
-
-  void _initSignaling() {
-    try {
-      SignalingManager().startHeartbeat();
-
-      if (mounted) {
-        SignalingManager().initCallListener(context);
-      }
-
-      // Уведомления только для десктопа
-      if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
-        SignalingManager().startListeningNotifications();
-      }
-    } catch (e) {
-      debugPrint("⚠️ Ошибка инициализации звонков: $e");
-    }
-  }
-
-  void _goToContacts() {
-    if (mounted) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (context) => const ContactsScreen()),
-      );
-    }
-  }
-
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
-    );
+  @override
+  void dispose() {
+    _phoneController.dispose();
+    _nameController.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final auth = ref.watch(authProvider);
+
+    ref.listen<AuthState>(authProvider, (previous, next) {
+      if (next.errorMessage != null &&
+          next.errorMessage != previous?.errorMessage) {
+        _showError(next.errorMessage!);
+        ref.read(authProvider.notifier).clearError();
+      }
+
+      if (next.isAuthenticated &&
+          previous?.isAuthenticated != next.isAuthenticated) {
+        _onAuthSuccess(next.authenticatedPhone!, next.authenticatedPassword!);
+      }
+    });
+
     return Scaffold(
       body: Container(
         decoration: BoxDecoration(
@@ -156,54 +59,60 @@ class _AuthScreenState extends State<AuthScreen> {
             child: Card(
               margin: const EdgeInsets.all(24),
               shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(24)),
+                borderRadius: BorderRadius.circular(24),
+              ),
               elevation: 10,
               child: Padding(
                 padding: const EdgeInsets.all(32),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.family_restroom,
-                        size: 80, color: Colors.blue.shade800),
+                    Icon(
+                      Icons.family_restroom,
+                      size: 80,
+                      color: Colors.blue.shade800,
+                    ),
                     const SizedBox(height: 16),
-                    const Text("Семейный Чат",
-                        style: TextStyle(
-                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    const Text(
+                      'Семейный Чат',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                     const SizedBox(height: 8),
-                    Text(_showNameField ? "Создание аккаунта" : "Авторизация",
-                        style: TextStyle(color: Colors.grey.shade600)),
+                    Text(
+                      auth.showNameField ? 'Создание аккаунта' : 'Авторизация',
+                      style: TextStyle(color: Colors.grey.shade600),
+                    ),
                     const SizedBox(height: 32),
-
-                    // Поле ввода номера
                     TextField(
                       controller: _phoneController,
                       keyboardType: TextInputType.phone,
                       decoration: InputDecoration(
                         prefixIcon: const Icon(Icons.phone),
-                        labelText: "Номер телефона",
-                        hintText: "79001234567",
+                        labelText: 'Номер телефона',
+                        hintText: '79001234567',
                         border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12)),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
                       ),
                     ),
-
-                    // Поле ввода имени (появляется если юзера нет)
-                    if (_showNameField) ...[
+                    if (auth.showNameField) ...[
                       const SizedBox(height: 16),
                       TextField(
                         controller: _nameController,
                         autofocus: true,
                         decoration: InputDecoration(
                           prefixIcon: const Icon(Icons.person),
-                          labelText: "Ваше имя (как вас видит семья)",
+                          labelText: 'Ваше имя (как вас видит семья)',
                           border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12)),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
                         ),
                       ),
                     ],
-
                     const SizedBox(height: 32),
-
                     SizedBox(
                       width: double.infinity,
                       height: 55,
@@ -212,15 +121,19 @@ class _AuthScreenState extends State<AuthScreen> {
                           backgroundColor: Colors.blue.shade800,
                           foregroundColor: Colors.white,
                           shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(15)),
+                            borderRadius: BorderRadius.circular(15),
+                          ),
                         ),
-                        onPressed: _isLoading ? null : _handleAuth,
-                        child: _isLoading
+                        onPressed: auth.isLoading ? null : _handleAuth,
+                        child: auth.isLoading
                             ? const CircularProgressIndicator(
-                                color: Colors.white)
-                            : Text(_showNameField
-                                ? "ЗАРЕГИСТРИРОВАТЬСЯ"
-                                : "ВОЙТИ"),
+                                color: Colors.white,
+                              )
+                            : Text(
+                                auth.showNameField
+                                    ? 'ЗАРЕГИСТРИРОВАТЬСЯ'
+                                    : 'ВОЙТИ',
+                              ),
                       ),
                     ),
                   ],
@@ -229,6 +142,110 @@ class _AuthScreenState extends State<AuthScreen> {
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  void _handleAuth() {
+    ref.read(authProvider.notifier).authenticate(
+          rawPhone: _phoneController.text,
+          name: _nameController.text,
+        );
+  }
+
+  Future<void> _onAuthSuccess(String phone, String password) async {
+    if (!kIsWeb && Platform.isWindows) {
+      await _setupBackgroundNotifications(phone);
+    }
+
+    _initSignaling();
+    await ref.read(authProvider.notifier).completeAuthSideEffects();
+    _goToContacts();
+  }
+
+  Future<void> _setupBackgroundNotifications(String phone) async {
+    final topicUrl = 'https://ntfy.sh/family_msg_$phone';
+
+    try {
+      await Process.run('reg', [
+        'delete',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+        '/v',
+        'FamilyChatNtfyWeb',
+        '/f',
+      ]);
+      await Process.run('reg', [
+        'delete',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+        '/v',
+        'FamilyChatNotifier',
+        '/f',
+      ]);
+
+      final prefs = await SharedPreferences.getInstance();
+      final isNtfySetup = prefs.getBool('ntfy_setup_$phone') ?? false;
+
+      if (isNtfySetup) {
+        debugPrint('✅ Уведомления Web Push уже были настроены ранее.');
+        return;
+      }
+
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: const Text('Настройка уведомлений'),
+          content: const Text(
+            'Сейчас единоразово откроется браузер для настройки системных уведомлений.\n\n'
+            'Пожалуйста, нажмите «Subscribe» (или «Разрешить») на открывшейся странице.\n'
+            'После этого вкладку браузера можно закрыть навсегда — уведомления будут приходить в фоне!',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('ОК, понятно'),
+            ),
+          ],
+        ),
+      );
+
+      final url = Uri.parse(topicUrl);
+      if (await canLaunchUrl(url)) {
+        await launchUrl(url, mode: LaunchMode.externalApplication);
+        await prefs.setBool('ntfy_setup_$phone', true);
+        debugPrint('✅ Браузер открыт. Флаг настройки сохранен.');
+      } else {
+        debugPrint('❌ Не удалось открыть браузер.');
+      }
+    } catch (e) {
+      debugPrint('❌ Ошибка настройки уведомлений: $e');
+    }
+  }
+
+  void _initSignaling() {
+    try {
+      ref.read(signalingSessionProvider.notifier).startAfterLogin(context);
+    } catch (e) {
+      debugPrint('⚠️ Ошибка инициализации звонков: $e');
+    }
+  }
+
+  void _goToContacts() {
+    if (mounted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => const ContactsScreen()),
+      );
+    }
+  }
+
+  void _showError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        behavior: SnackBarBehavior.floating,
       ),
     );
   }

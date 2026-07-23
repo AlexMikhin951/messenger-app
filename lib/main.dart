@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart'; // Для kIsWeb
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:local_notifier/local_notifier.dart';
 
 // Импорты экранов и сервисов
@@ -27,7 +28,11 @@ void main() async {
     }
   }
 
-  runApp(const FamilyMessengerApp());
+  runApp(
+    const ProviderScope(
+      child: FamilyMessengerApp(),
+    ),
+  );
 }
 
 class FamilyMessengerApp extends StatelessWidget {

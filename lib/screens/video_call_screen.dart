@@ -1,18 +1,17 @@
 import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/foundation.dart'
     show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:pocketbase/pocketbase.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'package:floating/floating.dart'; // <-- Пакет PiP
 
-import '../services/signaling_manager.dart';
-import '../services/api_service.dart';
+import '../providers/services_providers.dart';
 
-class VideoCallScreen extends StatefulWidget {
+class VideoCallScreen extends ConsumerStatefulWidget {
   final String receiverId;
   final bool isIncoming;
   final String? roomId;
@@ -27,17 +26,15 @@ class VideoCallScreen extends StatefulWidget {
   });
 
   @override
-  State<VideoCallScreen> createState() => _VideoCallScreenState();
+  ConsumerState<VideoCallScreen> createState() => _VideoCallScreenState();
 }
 
-class _VideoCallScreenState extends State<VideoCallScreen> {
-  final SignalingManager _signaling = SignalingManager();
+class _VideoCallScreenState extends ConsumerState<VideoCallScreen> {
+  SignalingManager get _signaling => ref.read(signalingManagerProvider);
+  ApiService get api => ref.read(apiServiceProvider);
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   final AudioPlayer _audioPlayer = AudioPlayer();
-
-  // Инициализация плагина Floating
-  final Floating _floating = Floating();
 
   Timer? _hideTimer;
   Timer? _dialTimeoutTimer;
@@ -75,11 +72,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     _signaling.isMinimized.value = false;
     WakelockPlus.enable();
 
-    // Задаем команду: автоматически переходить в PiP при сворачивании приложения
-    if (!_isDesktopOrWeb) {
-      _floating.enable(OnLeavePiP(aspectRatio: Rational(9, 16)));
-    }
-
     _initialize();
   }
 
@@ -99,26 +91,42 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       Helper.setSpeakerphoneOn(_isSpeakerOn);
     }
 
+    // --- ПРОВЕРЯЕМ, ВОССТАНАВЛИВАЕМ ЛИ МЫ ЗВОНОК ИЗ ОВЕРЛЕЯ ---
+    bool isRestoring = _signaling.localStream != null;
+
+    if (isRestoring) {
+      // Звонок уже идет!
+      _hasAccepted = true;
+      _isCallSuccessful = true;
+      _isRemoteVideoReady = _signaling.remoteStream != null;
+
+      // Биндим уже существующие потоки к новым рендерерам
+      _localRenderer.srcObject = _signaling.localStream;
+      _remoteRenderer.srcObject = _signaling.remoteStream;
+
+      // ВАЖНО: Обновляем слушатель состояния для этого нового экрана,
+      // иначе экран не закроется, если собеседник повесит трубку.
+      _signaling.onPeerConnectionState = _handleConnectionState;
+
+      if (mounted) {
+        setState(() => _isInitialized = true);
+      }
+      _startHideTimer();
+      return; // Выходим отсюда, инициализация нового звонка не нужна!
+    }
+
+    // --- ЛОГИКА НОВОГО ЗВОНКА ---
     if (widget.isIncoming) {
       _playRingtone();
       await Future.delayed(const Duration(milliseconds: 500));
       if (_activeRoomId != null) _listenToCallTermination();
     } else {
-      _playDialTone();
-
-      if (_signaling.localStream == null) {
-        await _startCall();
-      } else {
-        _localRenderer.srcObject = _signaling.localStream;
-        _remoteRenderer.srcObject = _signaling.remoteStream;
-        if (mounted) setState(() {});
-      }
+      _playDialTone(); // Звук играет ТОЛЬКО если это новый исходящий звонок
+      await _startCall();
     }
 
     if (mounted) {
-      setState(() {
-        _isInitialized = true;
-      });
+      setState(() => _isInitialized = true);
     }
     _startHideTimer();
 
@@ -130,15 +138,21 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     });
   }
 
-  Future<void> _markCallAsSuccess() async {
-    if (_isCallSuccessful || widget.messageId == null) return;
+  Future _markCallAsSuccess() async {
+    if (_isCallSuccessful) return;
     _isCallSuccessful = true;
-    _dialTimeoutTimer?.cancel();
+    _dialTimeoutTimer?.cancel(); // ТЕПЕРЬ ТАЙМЕР ОТМЕНИТСЯ ВСЕГДА
+    debugPrint("Звонок успешно установлен, таймер таймаута отменен.");
+
+    if (widget.messageId == null) return;
 
     try {
-      await ApiService().pb.collection('messages').update(
+      await api.pb.collection('messages').update(
         widget.messageId!,
-        body: {"type": "call_success"},
+        body: {
+          "type": "call_success",
+          "is_read": true,
+        },
       );
     } catch (e) {
       debugPrint("Ошибка обновления на call_success: $e");
@@ -149,20 +163,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     final bool isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    _signaling.onPeerConnectionState = (state) {
-      debugPrint("PeerConnectionState: $state");
-
-      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
-        _audioPlayer.stop();
-        _markCallAsSuccess();
-      }
-
-      if (state == RTCPeerConnectionState.RTCPeerConnectionStateClosed ||
-          state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
-          state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
-        _exit();
-      }
-    };
+    // Передаем наш новый метод
+    _signaling.onPeerConnectionState = _handleConnectionState;
 
     if (widget.isIncoming && _activeRoomId != null) {
       try {
@@ -200,7 +202,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     if (widget.messageId != null && !_isCallSuccessful) {
       try {
-        await ApiService().pb.collection('messages').update(
+        await api.pb.collection('messages').update(
           widget.messageId!,
           body: {"type": "call_missed"},
         );
@@ -208,6 +210,10 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         debugPrint("Ошибка обновления статуса звонка на missed: $e");
       }
     }
+
+    // ИСПРАВЛЕНИЕ КАМЕРЫ 1: Отвязываем потоки от UI перед завершением
+    _localRenderer.srcObject = null;
+    _remoteRenderer.srcObject = null;
 
     _signaling
         .hangUp(_activeRoomId)
@@ -231,26 +237,9 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           body: Center(child: CircularProgressIndicator()));
     }
 
-    // В вебе PiPSwitcher не работает, отдаем сразу интерфейс
-    if (_isDesktopOrWeb) {
-      return _buildFullScreenUI();
-    }
-
-    // Для мобильных используем переключатель экранов PiP
-    return PiPSwitcher(
-      childWhenEnabled: Scaffold(
-        backgroundColor: Colors.black,
-        body: _isRemoteVideoReady
-            ? RTCVideoView(_remoteRenderer,
-                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)
-            : const Center(
-                child: Icon(Icons.person, color: Colors.white, size: 50)),
-      ),
-      childWhenDisabled: _buildFullScreenUI(),
-    );
+    return _buildFullScreenUI();
   }
 
-  // Весь твой UI перенесен сюда без изменений (кроме верхней левой кнопки)
   Widget _buildFullScreenUI() {
     return PopScope(
       canPop: true,
@@ -300,19 +289,14 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                           shape: BoxShape.circle,
                         ),
                         child: IconButton(
-                          // Иконка сворачивания в окно
-                          icon: const Icon(Icons.picture_in_picture_alt,
+                          icon: const Icon(Icons.close_fullscreen,
                               color: Colors.white, size: 28),
                           onPressed: () {
-                            if (!_isDesktopOrWeb) {
-                              // Принудительно вызываем PiP по кнопке
-                              _floating.enable(
-                                  ImmediatePiP(aspectRatio: Rational(9, 16)));
-                            } else {
-                              _signaling.isGroupCall = false;
-                              _signaling.currentRoomId = _activeRoomId;
-                              _signaling.currentReceiverId = widget.receiverId;
-                              _signaling.isMinimized.value = true;
+                            _signaling.isGroupCall = false;
+                            _signaling.currentRoomId = _activeRoomId;
+                            _signaling.currentReceiverId = widget.receiverId;
+                            _signaling.isMinimized.value = true;
+                            if (Navigator.canPop(context)) {
                               Navigator.pop(context);
                             }
                           },
@@ -322,14 +306,14 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   ),
                 ),
               ),
-              AnimatedPositioned(
-                duration: const Duration(milliseconds: 300),
-                bottom: _showControls ? 40 : -120,
-                left: 0,
-                right: 0,
-                child: Center(child: _buildModernControlPanel()),
-              ),
             ],
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 300),
+              bottom: _showControls ? 40 : -120,
+              left: 0,
+              right: 0,
+              child: Center(child: _buildModernControlPanel()),
+            ),
             if (widget.isIncoming && !_hasAccepted) _buildIncomingCallUI(),
           ],
         ),
@@ -587,7 +571,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   Future<void> _loadCallerInfo() async {
     try {
       final user =
-          await ApiService().pb.collection('users').getOne(widget.receiverId);
+          await api.pb.collection('users').getOne(widget.receiverId);
       if (mounted) {
         setState(() => _callerName = user.getStringValue('name').isNotEmpty
             ? user.getStringValue('name')
@@ -608,7 +592,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   Future<void> _listenToCallTermination() async {
     if (_activeRoomId == null) return;
     try {
-      _unsubCall = await ApiService()
+      _unsubCall = await api
           .pb
           .collection('calls')
           .subscribe(_activeRoomId!, (e) {
@@ -625,7 +609,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         await _audioPlayer.setAudioContext(AudioContext(
           android: AudioContextAndroid(
             contentType: AndroidContentType.speech,
-            usageType: AndroidUsageType.voiceCommunication,
+            usageType:
+                AndroidUsageType.voiceCommunication, // Переводим в режим звонка
             audioFocus: AndroidAudioFocus.gainTransientMayDuck,
           ),
           iOS: AudioContextIOS(
@@ -785,19 +770,51 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     _hideTimer?.cancel();
     _dialTimeoutTimer?.cancel();
 
-    // ОТМЕНЯЕМ АВТОВКЛЮЧЕНИЕ PIP ПЕРЕД ВЫХОДОМ
-    if (!_isDesktopOrWeb) {
-      _floating.cancelOnLeavePiP();
-      // Метод _floating.dispose() здесь больше не нужен в новой версии пакета!
-    }
-
     if (_unsubCall != null) _unsubCall!();
 
     WakelockPlus.disable();
+
+    // ИСПРАВЛЕНИЕ КАМЕРЫ 2: Гарантированно отвязываем камеру от UI при уничтожении виджета
+    _localRenderer.srcObject = null;
+    _remoteRenderer.srcObject = null;
+
+    // ИСПРАВЛЕНИЕ НАУШНИКОВ: Возвращаем аудио-профиль телефона в режим "Медиа/Музыка"
+    if (!kIsWeb) {
+      try {
+        _audioPlayer.setAudioContext(AudioContext(
+          android: AudioContextAndroid(
+            contentType: AndroidContentType.music,
+            usageType: AndroidUsageType.media,
+            audioFocus: AndroidAudioFocus.gain,
+          ),
+          iOS: AudioContextIOS(
+            category: AVAudioSessionCategory.ambient,
+          ),
+        ));
+        Helper.setSpeakerphoneOn(false); // Сбрасываем громкую связь WebRTC
+      } catch (e) {
+        debugPrint("Ошибка сброса AudioContext: $e");
+      }
+    }
 
     _audioPlayer.dispose();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
     super.dispose();
+  }
+
+  void _handleConnectionState(RTCPeerConnectionState state) {
+    debugPrint("PeerConnectionState: $state");
+
+    if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+      _audioPlayer.stop();
+      _markCallAsSuccess();
+    }
+
+    if (state == RTCPeerConnectionState.RTCPeerConnectionStateClosed ||
+        state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+        state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+      _exit();
+    }
   }
 }

@@ -1,13 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:livekit_client/livekit_client.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-import '../services/livekit_service.dart';
-import '../services/signaling_manager.dart';
-import '../services/api_service.dart';
+import '../providers/services_providers.dart';
 
-class GroupCallScreen extends StatefulWidget {
+class GroupCallScreen extends ConsumerStatefulWidget {
   final String roomName;
   final String userName;
   final String identity;
@@ -22,20 +21,20 @@ class GroupCallScreen extends StatefulWidget {
   });
 
   @override
-  State<GroupCallScreen> createState() => _GroupCallScreenState();
+  ConsumerState<GroupCallScreen> createState() => _GroupCallScreenState();
 }
 
-class _GroupCallScreenState extends State<GroupCallScreen> {
-  final _liveKitService = LiveKitService();
-  final _signaling = SignalingManager();
+class _GroupCallScreenState extends ConsumerState<GroupCallScreen> {
+  LiveKitService get _liveKitService => ref.read(liveKitServiceProvider);
+  SignalingManager get _signaling => ref.read(signalingManagerProvider);
+  ApiService get api => ref.read(apiServiceProvider);
 
   List<Participant> participants = [];
   Room? _room;
   bool _isLoading = true;
-
   bool _isHangingUp = false;
-
   Participant? _focusParticipant;
+
   bool _isMicEnabled = true;
   bool _isCameraEnabled = true;
   bool _isScreenShareEnabled = false;
@@ -74,6 +73,7 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
 
       _signaling.currentLiveKitRoom = _room;
 
+      // 🔥 Теперь это единственный и правильный запуск медиа
       await _room!.localParticipant?.setCameraEnabled(_isCameraEnabled);
       await _room!.localParticipant?.setMicrophoneEnabled(_isMicEnabled);
 
@@ -94,6 +94,7 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
 
   void _onRoomDidUpdate() {
     if (!mounted || _room == null) return;
+
     final newParticipants = <Participant>[];
     if (_room!.localParticipant != null) {
       newParticipants.add(_room!.localParticipant!);
@@ -115,43 +116,44 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
     });
   }
 
-  // --- ИСПРАВЛЕННЫЙ МЕТОД ВЫХОДА ИЗ ЗВОНКА ---
   Future<void> _leaveCall() async {
+    if (_isHangingUp) return;
     _isHangingUp = true;
     _signaling.isMinimized.value = false;
 
-    if (_room != null) {
-      // 1. Проверяем, сколько людей было ДО нашего отключения
-      final int remainingParticipants = _room!.remoteParticipants.length;
+    _room?.removeListener(_onRoomDidUpdate);
+    final roomToDispose = _room;
+    final int remainingParticipants =
+        roomToDispose?.remoteParticipants.length ?? 0;
 
-      // 2. Жестко останавливаем камеру и микрофон с ожиданием (await)
-      await _room!.localParticipant?.setCameraEnabled(false);
-      await _room!.localParticipant?.setMicrophoneEnabled(false);
-      await _room!.localParticipant?.setScreenShareEnabled(false);
-
-      // Даем железу 100 мс, чтобы гарантированно потушить светодиод камеры
-      await Future.delayed(const Duration(milliseconds: 100));
-
-      // 3. Отключаемся от сервера LiveKit
-      await _room!.disconnect();
-
-      // 4. Завершаем звонок в чате ТОЛЬКО если мы остались последние (remaining == 0)
-      if (remainingParticipants == 0 && widget.messageId != null) {
-        try {
-          await ApiService()
-              .pb
-              .collection('group_messages')
-              .update(widget.messageId!, body: {"type": "call_ended"});
-        } catch (_) {}
-      }
-    }
-
-    // 5. ВАЖНО: Обнуляем _room, чтобы метод dispose() не попытался сделать всё это по второму кругу!
     _room = null;
     _signaling.currentLiveKitRoom = null;
 
     if (mounted) {
-      Navigator.pop(context);
+      Navigator.of(context).pop();
+    }
+
+    if (roomToDispose != null) {
+      try {
+        final local = roomToDispose.localParticipant;
+        if (local != null) {
+          local.setCameraEnabled(false);
+          local.setMicrophoneEnabled(false);
+          local.setScreenShareEnabled(false);
+        }
+
+        await roomToDispose.disconnect();
+        await roomToDispose.dispose();
+
+        if (remainingParticipants == 0 && widget.messageId != null) {
+          await api
+              .pb
+              .collection('group_messages')
+              .update(widget.messageId!, body: {"type": "call_ended"});
+        }
+      } catch (e) {
+        debugPrint("Ошибка при фоновом завершении звонка: $e");
+      }
     }
   }
 
@@ -198,10 +200,13 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
           ),
           itemCount: count,
           itemBuilder: (context, index) {
+            final participant = participants[index];
             return GestureDetector(
-              onTap: () =>
-                  setState(() => _focusParticipant = participants[index]),
-              child: ParticipantWidget(participant: participants[index]),
+              onTap: () => setState(() => _focusParticipant = participant),
+              child: ParticipantWidget(
+                key: ValueKey(participant.sid ?? participant.identity),
+                participant: participant,
+              ),
             );
           },
         );
@@ -213,8 +218,11 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
     return Stack(
       children: [
         Positioned.fill(
-          child:
-              ParticipantWidget(participant: _focusParticipant!, isFocus: true),
+          child: ParticipantWidget(
+              key: ValueKey(
+                  _focusParticipant!.sid ?? _focusParticipant!.identity),
+              participant: _focusParticipant!,
+              isFocus: true),
         ),
         Positioned(
           top: 40,
@@ -315,6 +323,7 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
     final audioInputs = await Hardware.instance.audioInputs();
     final audioOutputs = await Hardware.instance.audioOutputs();
     if (!mounted) return;
+
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.grey[900],
@@ -401,22 +410,23 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
     );
   }
 
-  // --- ОБНОВЛЕННЫЙ DISPOSE (Защита от дублирования кода) ---
   @override
   void dispose() {
     _room?.removeListener(_onRoomDidUpdate);
 
-    // Если _room не равен null, значит экран закрыли НЕ через кнопку "Завершить",
-    // а каким-то системным способом (например, жестким смахиванием)
     if (!_signaling.isMinimized.value && _room != null) {
-      final int remainingParticipants = _room!.remoteParticipants.length;
+      final roomToDispose = _room!;
+      final int remainingParticipants = roomToDispose.remoteParticipants.length;
 
-      _room!.localParticipant?.setCameraEnabled(false);
-      _room!.localParticipant?.setMicrophoneEnabled(false);
-      _room!.disconnect();
+      roomToDispose.localParticipant?.setCameraEnabled(false);
+      roomToDispose.localParticipant?.setMicrophoneEnabled(false);
+
+      roomToDispose.disconnect().then((_) {
+        roomToDispose.dispose();
+      });
 
       if (remainingParticipants == 0 && widget.messageId != null) {
-        ApiService().pb.collection('group_messages').update(widget.messageId!,
+        api.pb.collection('group_messages').update(widget.messageId!,
             body: {"type": "call_ended"}).catchError((_) {});
       }
     }
@@ -426,7 +436,6 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
   }
 }
 
-// ... ParticipantWidget ОСТАЕТСЯ БЕЗ ИЗМЕНЕНИЙ
 class ParticipantWidget extends StatefulWidget {
   final Participant participant;
   final bool isFocus;
@@ -440,32 +449,81 @@ class ParticipantWidget extends StatefulWidget {
 
 class _ParticipantWidgetState extends State<ParticipantWidget> {
   VideoTrack? videoTrack;
+  void Function()? _cancelEvents;
 
   @override
   void initState() {
     super.initState();
+    _setupListeners();
+  }
+
+  void _setupListeners() {
+    _cancelEvents?.call();
+    _cancelEvents = widget.participant.events.listen((event) {
+      if (mounted) _onParticipantChanged();
+    });
+
     widget.participant.addListener(_onParticipantChanged);
-    _onParticipantChanged();
+    _onParticipantChanged(); // Вызываем сразу для проверки
+  }
+
+  @override
+  void didUpdateWidget(covariant ParticipantWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.participant != widget.participant) {
+      oldWidget.participant.removeListener(_onParticipantChanged);
+      _setupListeners();
+    }
   }
 
   @override
   void dispose() {
+    _cancelEvents?.call();
     widget.participant.removeListener(_onParticipantChanged);
     super.dispose();
   }
 
   void _onParticipantChanged() {
+    if (!mounted) return;
+
     VideoTrack? newTrack;
-    for (var publication in widget.participant.videoTrackPublications) {
-      if (!publication.muted &&
-          publication.subscribed &&
-          publication.track != null) {
-        newTrack = publication.track as VideoTrack?;
+    final pubs = widget.participant.videoTrackPublications.toList();
+    final isLocal = widget.participant is LocalParticipant;
+
+    // 1. Приоритет демонстрации экрана
+    for (var pub in pubs) {
+      if (pub.source == TrackSource.screenShareVideo &&
+          pub.track != null &&
+          !pub.muted) {
+        newTrack = pub.track as VideoTrack;
         break;
       }
     }
-    if (newTrack != videoTrack) {
-      if (mounted) setState(() => videoTrack = newTrack);
+
+    // 2. Ищем камеру
+    if (newTrack == null) {
+      for (var pub in pubs) {
+        if (pub.source == TrackSource.camera && pub.track != null) {
+          if (isLocal || !pub.muted) {
+            newTrack = pub.track as VideoTrack;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. Запасной вариант (любой доступный видео трек)
+    if (newTrack == null) {
+      for (var pub in pubs) {
+        if (pub.track != null && (isLocal || !pub.muted)) {
+          newTrack = pub.track as VideoTrack;
+          break;
+        }
+      }
+    }
+
+    if (videoTrack != newTrack) {
+      setState(() => videoTrack = newTrack);
     }
   }
 
@@ -485,7 +543,9 @@ class _ParticipantWidgetState extends State<ParticipantWidget> {
           if (videoTrack != null)
             VideoTrackRenderer(
               videoTrack!,
-              fit: widget.isFocus ? VideoViewFit.cover : VideoViewFit.contain,
+              // 🔥 ИСПРАВЛЕНИЕ: УБРАН key. LiveKit SDK сам управляет текстурами.
+              // Принудительная смена ключа уничтожала плеер навсегда!
+              fit: widget.isFocus ? VideoViewFit.contain : VideoViewFit.cover,
             )
           else
             const Center(

@@ -1,319 +1,131 @@
-import 'dart:io'; // Для Platform
-import 'package:flutter/foundation.dart'; // Для kIsWeb
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // Для буфера обмена и звуков/вибрации
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:pocketbase/pocketbase.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:http/http.dart' as http;
 import 'package:audioplayers/audioplayers.dart';
-import '../services/api_service.dart';
-import 'video_call_screen.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:open_filex/open_filex.dart';
+import 'package:file_saver/file_saver.dart';
+import 'package:record/record.dart';
 
-class ChatScreen extends StatefulWidget {
+import '../providers/chat_composer_provider.dart';
+import '../providers/chat_messages_provider.dart';
+import '../providers/services_providers.dart';
+import 'video_call_screen.dart';
+
+enum AttachmentType { image, audio, document }
+
+class ChatScreen extends ConsumerStatefulWidget {
   final RecordModel receiver;
   const ChatScreen({super.key, required this.receiver});
 
   @override
-  State<ChatScreen> createState() => _ChatScreenState();
+  ConsumerState<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends ConsumerState<ChatScreen> {
   final _msgController = TextEditingController();
-  final List<RecordModel> _messages = [];
-  final api = ApiService();
   late String _myId;
-  bool _isInitialLoading = true;
 
-  final Map<String, bool> _downloadingFiles = {};
+  String get _composerKey => 'direct_${widget.receiver.id}';
 
-  // Аудиоплееры для звуков
+  ChatComposerNotifier get _composer =>
+      ref.read(chatComposerProvider(_composerKey).notifier);
+
+  ChatComposerState get _composerState =>
+      ref.watch(chatComposerProvider(_composerKey));
+
+  ApiService get api => ref.read(apiServiceProvider);
+
   final AudioPlayer _keyboardSoundPlayer = AudioPlayer();
   final AudioPlayer _messageSoundPlayer = AudioPlayer();
-
-  // Флаг для отслеживания первого нажатия (чтобы не играть звук при длительном удержании)
-  bool _isFirstKeyPress = true;
+  final AudioPlayer _previewAudioPlayer = AudioPlayer();
+  late final AudioRecorder _audioRecorder;
 
   @override
   void initState() {
     super.initState();
-    _myId = api.pb.authStore.record?.id ?? "";
-    // Устанавливаем громкость 70% для звука сообщений
+    _myId = api.pb.authStore.record?.id ?? '';
     _messageSoundPlayer.setVolume(0.7);
-    if (_myId.isNotEmpty) {
-      _initChat();
-    } else {
-      debugPrint("Ошибка: Пользователь не авторизован");
-      setState(() => _isInitialLoading = false);
-    }
-  }
+    _audioRecorder = AudioRecorder();
 
-  Future<void> _initChat() async {
-    await _loadMessages();
-    await _markAsRead();
-    _subscribeToMessages();
-  }
-
-  // Метод для воспроизведения тихого звука клавиатуры (как в Telegram)
-  Future<void> _playKeyboardSound() async {
-    try {
-      // Используем очень тихий системный звук или пользовательский файл
-      await _keyboardSoundPlayer.setVolume(0.1); // Очень тихо
-      await _keyboardSoundPlayer.play(AssetSource('keyboardtap.mp3'));
-    } catch (e) {
-      try {
-        await SystemSound.play(SystemSoundType.click);
-      } catch (_) {}
-    }
-  }
-
-  // Метод для воспроизведения звука сообщения (70% громкости)
-  Future<void> _playMessageSound() async {
-    try {
-      await _messageSoundPlayer.setVolume(0.7);
-      await _messageSoundPlayer.play(AssetSource('mes.mp3'));
-    } catch (e) {
-      debugPrint("Ошибка воспроизведения звука сообщения: $e");
-    }
-  }
-
-  // Метод для копирования текста в буфер обмена
-  void _copyToClipboard(String text) {
-    HapticFeedback.lightImpact(); // Мягкая вибрация при копировании
-    Clipboard.setData(ClipboardData(text: text));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Скопировано в буфер обмена"),
-          duration: Duration(seconds: 1),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    }
-  }
-
-  Future<void> _markAsRead() async {
-    try {
-      final unread = _messages.where((m) {
-        final type = m.getStringValue('type');
-        return m.getStringValue('receiver') == _myId &&
-            m.getBoolValue('is_read') == false &&
-            (type == 'text' ||
-                type == 'file' ||
-                type == 'call_missed' ||
-                type == 'call_success' ||
-                type == 'call_started'); // Добавили call_started
-      }).toList();
-
-      if (unread.isEmpty) return;
-
-      for (var m in unread) {
-        await api.pb
-            .collection('messages')
-            .update(m.id, body: {"is_read": true});
-      }
-    } catch (e) {
-      debugPrint("Ошибка markAsRead: $e");
-    }
-  }
-
-  Future<void> _loadMessages() async {
-    try {
-      final records = await api.pb.collection('messages').getFullList(
-            filter:
-                '(sender = "$_myId" && receiver = "${widget.receiver.id}") || '
-                '(sender = "${widget.receiver.id}" && receiver = "$_myId")',
-            sort: '-created',
-          );
+    _previewAudioPlayer.onPlayerStateChanged.listen((state) {
       if (mounted) {
-        setState(() {
-          _messages.clear();
-          _messages.addAll(records);
-          _isInitialLoading = false;
-        });
-      }
-    } catch (e) {
-      debugPrint("Ошибка загрузки сообщений: $e");
-      if (mounted) setState(() => _isInitialLoading = false);
-    }
-  }
-
-  void _subscribeToMessages() {
-    api.pb.collection('messages').subscribe('*', (e) {
-      if (e.record != null) {
-        final m = e.record!;
-        final senderId = m.getStringValue('sender');
-        final receiverId = m.getStringValue('receiver');
-        final type = m.getStringValue('type');
-
-        if ((senderId == _myId && receiverId == widget.receiver.id) ||
-            (senderId == widget.receiver.id && receiverId == _myId)) {
-          if (mounted) {
-            setState(() {
-              if (e.action == 'create') {
-                _messages.insert(0, m);
-
-                // Воспроизводим звук и вибрацию при получении чужого сообщения
-                if (senderId != _myId) {
-                  HapticFeedback.lightImpact();
-                  _playMessageSound();
-                }
-
-                if (receiverId == _myId && (type == 'text' || type == 'file')) {
-                  _markAsRead();
-                }
-              } else if (e.action == 'update') {
-                final index = _messages.indexWhere((el) => el.id == m.id);
-                if (index != -1) {
-                  _messages[index] = m;
-                }
-                if (receiverId == _myId &&
-                    (type == 'call_missed' ||
-                        type == 'call_success' ||
-                        type == 'call_started')) {
-                  _markAsRead();
-                }
-              }
-            });
-          }
-        }
+        _composer.setPlayingPreview(state == PlayerState.playing);
       }
     });
   }
 
+  Future<void> _playKeyboardSound() async {
+    try {
+      await _keyboardSoundPlayer.setVolume(0.1);
+      await _keyboardSoundPlayer.play(AssetSource('sounds/keyboardtap.mp3'));
+    } catch (_) {}
+  }
+
+  Future<void> _playMessageSound() async {
+    try {
+      await _messageSoundPlayer.setVolume(0.3);
+      await _messageSoundPlayer.play(AssetSource('sounds/mes.mp3'));
+    } catch (e) {
+      debugPrint("Ошибка звука: $e");
+    }
+  }
+
+  void _copyToClipboard(String text) {
+    HapticFeedback.lightImpact();
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+          content: Text("Скопировано"), duration: Duration(seconds: 1)),
+    );
+  }
+
   Future<void> _sendMessage() async {
     if (_msgController.text.trim().isEmpty) return;
-
     HapticFeedback.mediumImpact();
     _playMessageSound();
 
     final text = _msgController.text.trim();
     _msgController.clear();
-    try {
-      await api.pb.collection('messages').create(body: {
-        "sender": _myId,
-        "receiver": widget.receiver.id,
-        "content": text,
-        "type": "text",
-        "is_read": false,
-      });
-    } catch (e) {
-      debugPrint("Ошибка отправки: $e");
-    }
-  }
-
-  Future<void> _pickAndSendFile() async {
-    FilePickerResult? result =
-        await FilePicker.platform.pickFiles(withData: true);
-    if (result != null) {
-      final fileObj = result.files.single;
-      setState(() => _isInitialLoading = true);
-      try {
-        http.MultipartFile multipartFile;
-        if (kIsWeb) {
-          if (fileObj.bytes == null)
-            throw Exception("Не удалось прочитать файл");
-          multipartFile = http.MultipartFile.fromBytes(
-              'attachment', fileObj.bytes!,
-              filename: fileObj.name);
-        } else {
-          if (fileObj.path == null) return;
-          multipartFile = await http.MultipartFile.fromPath(
-              'attachment', fileObj.path!,
-              filename: fileObj.name);
-        }
-
-        HapticFeedback.mediumImpact();
-        _playMessageSound();
-
-        await api.pb.collection('messages').create(
-          body: {
-            "sender": _myId,
-            "receiver": widget.receiver.id,
-            "content": fileObj.name,
-            "type": "file",
-            "is_read": false,
-          },
-          files: [multipartFile],
-        );
-      } catch (e) {
-        debugPrint("Ошибка отправки файла: $e");
-      } finally {
-        if (mounted) setState(() => _isInitialLoading = false);
-      }
-    }
-  }
-
-  Future<void> _handleFileTap(RecordModel m) async {
-    final String attachmentName = m.getStringValue('attachment');
-    if (attachmentName.isEmpty) return;
-
-    if (kIsWeb) {
-      final fileUrl = api.pb.files.getUrl(m, attachmentName).toString();
-      await launchUrl(Uri.parse(fileUrl));
-      return;
-    }
-
-    setState(() => _downloadingFiles[m.id] = true);
 
     try {
-      final fileUrl = api.pb.files.getUrl(m, attachmentName).toString();
-      final dir = await getApplicationDocumentsDirectory();
-      final filePath = "${dir.path}/$attachmentName";
-      final file = File(filePath);
+      await ref.read(chatMessagesProvider(widget.receiver.id).notifier).sendText(
+            text: text,
+            editingMessageId: _composerState.editingMessageId,
+          );
+      _composer.clearEditing();
+    } catch (_) {}
+  }
 
-      if (await file.exists()) {
-        await OpenFilex.open(filePath);
-        return;
-      }
-
-      final client = api.pb.httpClientFactory();
-      final response = await client.get(Uri.parse(fileUrl));
-
-      if (response.statusCode == 200) {
-        await file.writeAsBytes(response.bodyBytes);
-        final result = await OpenFilex.open(filePath);
-        if (result.type != ResultType.done) {
-          throw "Не удалось открыть файл: ${result.message}";
-        }
-      } else {
-        throw "Ошибка загрузки: ${response.statusCode}";
-      }
-
-      client.close();
+  Future<void> _deleteMessage(String id) async {
+    try {
+      await ref
+          .read(chatMessagesProvider(widget.receiver.id).notifier)
+          .deleteMessage(id);
     } catch (e) {
-      debugPrint("Ошибка при работе с файлом: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-              content: Text("Ошибка открытия файла: $e"),
-              backgroundColor: Colors.red),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _downloadingFiles.remove(m.id));
+      debugPrint('Ошибка удаления: $e');
     }
   }
 
+  // ==========================================
+  // ЛОГИКА ЗВОНКА
+  // ==========================================
   void _startVideoCall() async {
     if (_myId.isEmpty) return;
+
+    HapticFeedback.heavyImpact();
+
     String? createdMessageId;
-
-    HapticFeedback.heavyImpact(); // Сильная вибрация при звонке
-
     try {
-      final callMsg = await api.pb.collection('messages').create(body: {
-        "sender": _myId,
-        "receiver": widget.receiver.id,
-        "content": "звонок", // Отправляем просто слово-маркер
-        "type": "call_started", // Новый статус
-        "is_read": false,
-      });
-      createdMessageId = callMsg.id;
+      createdMessageId = await ref
+          .read(chatMessagesProvider(widget.receiver.id).notifier)
+          .startVideoCall();
     } catch (e) {
-      debugPrint("Ошибка создания звонка: $e");
+      debugPrint('Ошибка создания звонка: $e');
     }
 
     if (!mounted) return;
@@ -329,13 +141,241 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  void _onTextChanged(String text) {
-    HapticFeedback.selectionClick();
-    _playKeyboardSound();
+  // ==========================================
+  // МЕНЮ СООБЩЕНИЙ (Telegram Style)
+  // ==========================================
+  void _showMessageOptions(RecordModel m) {
+    final isMe = m.getStringValue('sender') == _myId;
+    final type = m.getStringValue('type');
+    final isRead = m.getBoolValue('is_read');
+    final content = m.getStringValue('content');
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text("Действия",
+                  style: TextStyle(
+                      color: Colors.grey.shade600,
+                      fontWeight: FontWeight.bold)),
+            ),
+            if (type == 'text')
+              ListTile(
+                leading: const Icon(Icons.copy, color: Colors.blue),
+                title: const Text('Копировать текст'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _copyToClipboard(content);
+                },
+              ),
+            if (type == 'text' && isMe && !isRead)
+              ListTile(
+                leading: const Icon(Icons.edit, color: Colors.green),
+                title: const Text('Изменить'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _composer.startEditing(m.id);
+                  _msgController.text = content;
+                },
+              ),
+            if (type == 'file')
+              ListTile(
+                leading: const Icon(Icons.download, color: Colors.blue),
+                title: const Text('Скачать файл'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _downloadAndSaveFile(m);
+                },
+              ),
+            if (isMe && !isRead)
+              ListTile(
+                leading: const Icon(Icons.delete, color: Colors.red),
+                title:
+                    const Text('Удалить', style: TextStyle(color: Colors.red)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _deleteMessage(m.id);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ==========================================
+  // ДИКТОФОН И ФАЙЛЫ
+  // ==========================================
+  Future<void> _toggleRecording() async {
+    if (_composerState.isRecording) {
+      try {
+        final path = await _audioRecorder.stop();
+        _composer.setRecording(false, filePath: path);
+        HapticFeedback.lightImpact();
+      } catch (e) {
+        debugPrint('Ошибка остановки: $e');
+      }
+    } else {
+      try {
+        if (await _audioRecorder.hasPermission()) {
+          final dir = await getTemporaryDirectory();
+          final filePath =
+              '${dir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
+          await _audioRecorder.start(
+              const RecordConfig(encoder: AudioEncoder.aacLc),
+              path: filePath);
+          _composer.setRecording(true);
+          HapticFeedback.lightImpact();
+        }
+      } catch (e) {
+        debugPrint('Ошибка записи: $e');
+      }
+    }
+  }
+
+  Future<void> _deleteRecording() async {
+    await _previewAudioPlayer.stop();
+    _composer.setRecording(false);
+    _composer.setPlayingPreview(false);
+  }
+
+  Future<void> _togglePreview() async {
+    if (_composerState.recordedFilePath == null) return;
+    if (_composerState.isPlayingPreview) {
+      await _previewAudioPlayer.pause();
+    } else {
+      await _previewAudioPlayer
+          .play(DeviceFileSource(_composerState.recordedFilePath!));
+    }
+  }
+
+  Future<void> _sendRecordedVoice() async {
+    if (_composerState.recordedFilePath == null) return;
+    final path = _composerState.recordedFilePath!;
+    await _deleteRecording();
+    await _sendFileToServer(path, 'Голосовое_сообщение.m4a', isPath: true);
+  }
+
+  Future<void> _pickAndSendFile() async {
+    FilePickerResult? result =
+        await FilePicker.platform.pickFiles(withData: kIsWeb);
+    if (result != null) {
+      final fileObj = result.files.single;
+      if (kIsWeb) {
+        if (fileObj.bytes == null) return;
+        _sendFileToServer(fileObj.bytes, fileObj.name, isPath: false);
+      } else {
+        if (fileObj.path == null) return;
+        _sendFileToServer(fileObj.path, fileObj.name, isPath: true);
+      }
+    }
+  }
+
+  Future<void> _sendFileToServer(dynamic fileData, String fileName,
+      {required bool isPath}) async {
+    _composer.setUploading(true);
+    try {
+      http.MultipartFile multipartFile;
+      if (isPath) {
+        multipartFile = await http.MultipartFile.fromPath(
+            'attachment', fileData as String,
+            filename: fileName.split('/').last);
+      } else {
+        multipartFile = http.MultipartFile.fromBytes(
+            'attachment', fileData as Uint8List,
+            filename: fileName);
+      }
+
+      HapticFeedback.mediumImpact();
+      await api.pb.collection('messages').create(
+        body: {
+          "sender": _myId,
+          "receiver": widget.receiver.id,
+          "content": fileName,
+          "type": "file",
+          "is_read": false,
+        },
+        files: [multipartFile],
+      );
+    } catch (e) {
+      debugPrint("Ошибка отправки: $e");
+    } finally {
+      if (mounted) _composer.setUploading(false);
+    }
+  }
+
+  Future<void> _downloadAndSaveFile(RecordModel m) async {
+    final String attachmentName = m.getStringValue('attachment');
+    if (attachmentName.isEmpty) return;
+
+    if (kIsWeb) {
+      final fileUrl = api.pb.files.getUrl(m, attachmentName).toString();
+      await launchUrl(Uri.parse(fileUrl));
+      return;
+    }
+
+    _composer.setDownloading(m.id, true);
+    try {
+      final fileUrl = api.pb.files.getUrl(m, attachmentName).toString();
+      final client = api.pb.httpClientFactory();
+      final response = await client.get(Uri.parse(fileUrl));
+
+      if (response.statusCode == 200) {
+        String ext = attachmentName.split('.').last;
+        String nameWithoutExt =
+            attachmentName.substring(0, attachmentName.lastIndexOf('.'));
+
+        String? savedPath = await FileSaver.instance.saveAs(
+          name: nameWithoutExt,
+          bytes: response.bodyBytes,
+          ext: ext,
+          mimeType: MimeType.other,
+        );
+
+        if (savedPath != null && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text("Файл успешно сохранен!"),
+              backgroundColor: Colors.green));
+        }
+      }
+      client.close();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text("Ошибка сохранения"), backgroundColor: Colors.red));
+      }
+    } finally {
+      if (mounted) _composer.setDownloading(m.id, false);
+    }
+  }
+
+  AttachmentType _getAttachmentType(String fileName) {
+    final ext = fileName.split('.').last.toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(ext)) {
+      return AttachmentType.image;
+    }
+    if (['mp3', 'm4a', 'wav', 'ogg', 'aac'].contains(ext)) {
+      return AttachmentType.audio;
+    }
+    return AttachmentType.document;
+  }
+
+  void _openImageFullScreen(String imageUrl) {
+    Navigator.push(
+        context,
+        MaterialPageRoute(
+            builder: (_) => FullScreenImageViewer(imageUrl: imageUrl)));
   }
 
   @override
   Widget build(BuildContext context) {
+    final chatState = ref.watch(chatMessagesProvider(widget.receiver.id));
+
     return Scaffold(
       backgroundColor: const Color(0xFFF5F7FB),
       appBar: AppBar(
@@ -354,6 +394,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(fontSize: 18)),
           ],
         ),
+        // ВЕРНУЛИ КНОПКУ ЗВОНКА!
         actions: [
           IconButton(
             icon: const Icon(Icons.videocam_rounded,
@@ -366,17 +407,19 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: _isInitialLoading
+            child: chatState.isInitialLoading
                 ? const Center(child: CircularProgressIndicator())
                 : ListView.builder(
                     reverse: true,
                     padding: const EdgeInsets.symmetric(
                         horizontal: 12, vertical: 16),
-                    itemCount: _messages.length,
+                    itemCount: chatState.messages.length,
                     itemBuilder: (context, index) =>
-                        _renderMessage(_messages[index]),
+                        _renderMessage(chatState.messages[index]),
                   ),
           ),
+          if (_composerState.isUploading)
+            const LinearProgressIndicator(minHeight: 3, color: Colors.blue),
           _buildInputArea(),
         ],
       ),
@@ -385,15 +428,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _renderMessage(RecordModel m) {
     final String type = m.getStringValue('type', 'text');
-    // Обрабатываем все 3 типа звонков
     if (type == 'call_missed' ||
         type == 'call_success' ||
         type == 'call_started') {
-      return _buildSystemMessage(m);
+      return _buildSystemMessage(m); // ВЕРНУЛИ ПЛАШКИ ЗВОНКОВ!
     }
     return _buildMessageBubble(m);
   }
 
+  // МЕТОД ДЛЯ КРАСИВЫХ ПЛАШЕК О ЗВОНКАХ
   Widget _buildSystemMessage(RecordModel m) {
     final String type = m.getStringValue('type');
     final bool isMe = m.getStringValue('sender') == _myId;
@@ -458,14 +501,73 @@ class _ChatScreenState extends State<ChatScreen> {
     final String type = m.getStringValue('type');
     final String content = m.getStringValue('content');
     final bool isRead = m.getBoolValue('is_read');
-    final bool isDownloading = _downloadingFiles[m.id] ?? false;
+    final String attachment = m.getStringValue('attachment');
+
+    Widget bubbleContent;
+
+    if (type == 'file' && attachment.isNotEmpty) {
+      final fileUrl = api.pb.files.getUrl(m, attachment).toString();
+      final attType = _getAttachmentType(attachment);
+      final isDownloading = _composerState.downloadingFiles[m.id] ?? false;
+
+      switch (attType) {
+        case AttachmentType.image:
+          bubbleContent = GestureDetector(
+            onTap: () => _openImageFullScreen(fileUrl),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 300),
+                child: Image.network(fileUrl, fit: BoxFit.cover),
+              ),
+            ),
+          );
+          break;
+        case AttachmentType.audio:
+          bubbleContent = InlineAudioPlayer(audioUrl: fileUrl, isMe: isMe);
+          break;
+        case AttachmentType.document:
+          bubbleContent = InkWell(
+            onTap: () => _downloadAndSaveFile(m),
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                  color: isMe ? Colors.blue.shade700 : Colors.grey.shade200,
+                  borderRadius: BorderRadius.circular(8)),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  isDownloading
+                      ? const SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: Colors.white))
+                      : Icon(Icons.insert_drive_file,
+                          color: isMe ? Colors.white : Colors.blue, size: 30),
+                  const SizedBox(width: 12),
+                  Flexible(
+                      child: Text(content,
+                          style: TextStyle(
+                              color: isMe ? Colors.white : Colors.black87),
+                          overflow: TextOverflow.ellipsis)),
+                ],
+              ),
+            ),
+          );
+          break;
+      }
+    } else {
+      bubbleContent = Text(content,
+          style: TextStyle(
+              color: isMe ? Colors.white : Colors.black87, fontSize: 16));
+    }
 
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
-        onTap: type == 'file' ? () => _handleFileTap(m) : null,
-        onLongPress: () => _copyToClipboard(content),
-        onSecondaryTap: () => _copyToClipboard(content),
+        onLongPress: () => _showMessageOptions(m),
+        onSecondaryTap: () => _showMessageOptions(m),
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 4),
           padding: const EdgeInsets.all(12),
@@ -483,47 +585,28 @@ class _ChatScreenState extends State<ChatScreen> {
               BoxShadow(
                   color: Colors.black.withOpacity(0.05),
                   blurRadius: 4,
-                  offset: const Offset(0, 2)),
+                  offset: const Offset(0, 2))
             ],
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (type == 'file')
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (isDownloading)
-                      const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: Colors.white))
-                    else
-                      Icon(Icons.insert_drive_file,
-                          color: isMe ? Colors.white : Colors.blue),
-                    const SizedBox(width: 8),
-                    Flexible(
-                      child: Text(content,
-                          style: TextStyle(
-                              color: isMe ? Colors.white : Colors.black87,
-                              decoration: TextDecoration.underline)),
-                    ),
-                  ],
-                )
-              else
-                Text(content,
-                    style: TextStyle(
-                        color: isMe ? Colors.white : Colors.black87,
-                        fontSize: 16)),
+              bubbleContent,
               if (isMe)
                 Padding(
                   padding: const EdgeInsets.only(top: 4),
-                  child: Icon(
-                    isRead ? Icons.done_all : Icons.done,
-                    size: 16,
-                    color: isRead ? Colors.lightBlueAccent : Colors.white70,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_composerState.editingMessageId == m.id)
+                        const Icon(Icons.edit, size: 12, color: Colors.white54),
+                      if (_composerState.editingMessageId == m.id) const SizedBox(width: 4),
+                      Icon(isRead ? Icons.done_all : Icons.done,
+                          size: 16,
+                          color:
+                              isRead ? Colors.lightBlueAccent : Colors.white70),
+                    ],
                   ),
                 ),
             ],
@@ -535,46 +618,96 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildInputArea() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        boxShadow: [
-          BoxShadow(
-              color: Colors.black.withOpacity(0.05),
-              blurRadius: 10,
-              offset: const Offset(0, -2))
-        ],
-      ),
+      decoration: BoxDecoration(color: Colors.white, boxShadow: [
+        BoxShadow(
+            color: Colors.black.withOpacity(0.05),
+            blurRadius: 10,
+            offset: const Offset(0, -2))
+      ]),
       child: SafeArea(
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            IconButton(
-              icon: const Icon(Icons.add_circle_outline,
-                  color: Colors.blue, size: 28),
-              onPressed: _pickAndSendFile,
-            ),
-            Expanded(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                decoration: BoxDecoration(
-                    color: Colors.grey.shade100,
-                    borderRadius: BorderRadius.circular(24)),
-                child: TextField(
-                  controller: _msgController,
-                  onChanged: _onTextChanged,
-                  decoration: const InputDecoration(
-                      hintText: "Сообщение...", border: InputBorder.none),
-                  onSubmitted: (_) => _sendMessage(),
+            // ПЛАШКА РЕДАКТИРОВАНИЯ
+            if (_composerState.editingMessageId != null)
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                color: Colors.blue.shade50,
+                child: Row(
+                  children: [
+                    const Icon(Icons.edit, color: Colors.blue, size: 20),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                        child: Text("Редактирование сообщения",
+                            style: TextStyle(
+                                color: Colors.blue,
+                                fontWeight: FontWeight.bold))),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.blue),
+                      onPressed: () {
+                        _composer.clearEditing();
+                        _msgController.clear();
+                      },
+                    )
+                  ],
                 ),
               ),
-            ),
-            const SizedBox(width: 8),
-            CircleAvatar(
-              backgroundColor: Colors.blue,
-              child: IconButton(
-                icon: const Icon(Icons.send, color: Colors.white, size: 20),
-                onPressed: _sendMessage,
-              ),
+
+            // ПАНЕЛЬ ПРЕДПРОСЛУШИВАНИЯ ИЛИ ВВОД ТЕКСТА
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              child: _composerState.recordedFilePath != null
+                  ? _buildPreviewAudioPanel()
+                  : Row(
+                      children: [
+                        IconButton(
+                            icon: const Icon(Icons.attach_file,
+                                color: Colors.blue),
+                            onPressed: _pickAndSendFile),
+                        Expanded(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            decoration: BoxDecoration(
+                                color: Colors.grey.shade100,
+                                borderRadius: BorderRadius.circular(24)),
+                            child: TextField(
+                              controller: _msgController,
+                              onChanged: (_) => _playKeyboardSound(),
+                              decoration: InputDecoration(
+                                hintText: _composerState.isRecording
+                                    ? 'Идет запись...'
+                                    : 'Сообщение...',
+                                hintStyle: TextStyle(
+                                    color: _composerState.isRecording
+                                        ? Colors.red
+                                        : Colors.grey),
+                                border: InputBorder.none,
+                              ),
+                              readOnly: _composerState.isRecording,
+                              onSubmitted: (_) => _sendMessage(),
+                            ),
+                          ),
+                        ),
+                        // КНОПКА МИКРОФОНА
+                        IconButton(
+                          icon: Icon(
+                              _composerState.isRecording ? Icons.stop_circle : Icons.mic,
+                              color:
+                                  _composerState.isRecording ? Colors.red : Colors.blueGrey,
+                              size: 28),
+                          onPressed: _toggleRecording,
+                        ),
+                        // КНОПКА ОТПРАВКИ (Всегда видима)
+                        CircleAvatar(
+                          backgroundColor: Colors.blue,
+                          child: IconButton(
+                              icon: const Icon(Icons.send,
+                                  color: Colors.white, size: 20),
+                              onPressed: _sendMessage),
+                        ),
+                      ],
+                    ),
             ),
           ],
         ),
@@ -582,14 +715,148 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Widget _buildPreviewAudioPanel() {
+    return Row(
+      children: [
+        IconButton(
+            icon: const Icon(Icons.delete, color: Colors.red),
+            onPressed: _deleteRecording),
+        Expanded(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+                color: Colors.blue.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(24)),
+            child: Row(
+              children: [
+                GestureDetector(
+                  onTap: _togglePreview,
+                  child: Icon(
+                      _composerState.isPlayingPreview
+                          ? Icons.pause_circle
+                          : Icons.play_circle,
+                      color: Colors.blue,
+                      size: 30),
+                ),
+                const SizedBox(width: 12),
+                const Text("Голосовое сообщение",
+                    style: TextStyle(
+                        color: Colors.blue, fontWeight: FontWeight.bold)),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        CircleAvatar(
+          backgroundColor: Colors.blue,
+          child: IconButton(
+              icon: const Icon(Icons.send, color: Colors.white, size: 20),
+              onPressed: _sendRecordedVoice),
+        ),
+      ],
+    );
+  }
+
   @override
   void dispose() {
-    try {
-      api.pb.collection('messages').unsubscribe('*');
-    } catch (_) {}
-    _msgController.dispose();
-    _keyboardSoundPlayer.dispose();
-    _messageSoundPlayer.dispose();
+    _previewAudioPlayer.dispose();
+    _audioRecorder.dispose();
     super.dispose();
+  }
+}
+
+// ==========================================
+// ПЛЕЕРЫ МЕДИА И ПРОСМОТР ФОТО
+// ==========================================
+class FullScreenImageViewer extends StatelessWidget {
+  final String imageUrl;
+  const FullScreenImageViewer({super.key, required this.imageUrl});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+          backgroundColor: Colors.black,
+          iconTheme: const IconThemeData(color: Colors.white)),
+      body: Center(
+        child: InteractiveViewer(
+            minScale: 0.1, maxScale: 4.0, child: Image.network(imageUrl)),
+      ),
+    );
+  }
+}
+
+class InlineAudioPlayer extends StatefulWidget {
+  final String audioUrl;
+  final bool isMe;
+  const InlineAudioPlayer(
+      {super.key, required this.audioUrl, required this.isMe});
+
+  @override
+  State<InlineAudioPlayer> createState() => _InlineAudioPlayerState();
+}
+
+class _InlineAudioPlayerState extends State<InlineAudioPlayer> {
+  final AudioPlayer _player = AudioPlayer();
+  bool _isPlaying = false;
+  Duration _duration = Duration.zero;
+  Duration _position = Duration.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _player.setSourceUrl(widget.audioUrl);
+    _player.onDurationChanged.listen((d) => setState(() => _duration = d));
+    _player.onPositionChanged.listen((p) => setState(() => _position = p));
+    _player.onPlayerStateChanged.listen((state) {
+      if (mounted) setState(() => _isPlaying = state == PlayerState.playing);
+    });
+  }
+
+  @override
+  void dispose() {
+    _player.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          icon: Icon(
+              _isPlaying ? Icons.pause_circle_filled : Icons.play_circle_fill),
+          color: widget.isMe ? Colors.white : Colors.blue,
+          iconSize: 36,
+          onPressed: () => _isPlaying
+              ? _player.pause()
+              : _player.play(UrlSource(widget.audioUrl)),
+        ),
+        SizedBox(
+          width: 150,
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6)),
+            child: Slider(
+              activeColor: widget.isMe ? Colors.white : Colors.blue,
+              inactiveColor:
+                  widget.isMe ? Colors.white54 : Colors.grey.shade300,
+              min: 0,
+              max: _duration.inSeconds.toDouble() > 0
+                  ? _duration.inSeconds.toDouble()
+                  : 1.0,
+              value: _position.inSeconds.toDouble().clamp(
+                  0.0,
+                  _duration.inSeconds.toDouble() > 0
+                      ? _duration.inSeconds.toDouble()
+                      : 1.0),
+              onChanged: (val) => _player.seek(Duration(seconds: val.toInt())),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
